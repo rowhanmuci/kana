@@ -1,0 +1,22 @@
+# 環境變數（絕對不要 commit）
+.env
+
+# 資料庫
+data/kana.db
+data/kana.db-wal
+data/kana.db-shm
+
+# Log
+kana.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+
+# 虛擬環境
+venv/
+env/
+.venv/
