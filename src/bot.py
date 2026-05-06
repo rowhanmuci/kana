@@ -66,6 +66,11 @@ intents.dm_messages = True
 bot = discord.Client(intents=intents)
 scheduler = AsyncIOScheduler()
 
+# ── 訊息緩衝區（分段訊息合併用）────────────────────────────────────────────────
+# 同一個 user 在延遲期間傳來的訊息全部累積，時間到了才一起回
+_message_buffer: dict[str, list[str]] = {}   # user_id → 待回覆的訊息列表
+_reply_tasks:   dict[str, asyncio.Task] = {}  # user_id → 當前待執行的回覆 task
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # REPLY PIPELINE
@@ -89,64 +94,95 @@ async def on_message(message: discord.Message):
     # 1. 初始化新使用者
     ensure_user_exists(user_id, display_name)
 
-    # 2. 判斷要不要回
+    # 2. 取消舊的待回覆 task（如果有的話），準備合併訊息
+    existing_task = _reply_tasks.get(user_id)
+    if existing_task and not existing_task.done():
+        existing_task.cancel()
+        logger.info("[訊息] 取消舊排程，合併訊息：user=%s（已累積 %d 則）",
+                    user_id, len(_message_buffer.get(user_id, [])))
+
+    # 3. 累積訊息
+    if user_id not in _message_buffer:
+        _message_buffer[user_id] = []
+    _message_buffer[user_id].append(message.content)
+
+    # 4. 判斷要不要回（以最新訊息為準）
     delay = calculate_reply_delay(user_id, message.content)
     if delay is None:
-        # 區分「睡覺/體力耗盡」vs「主動忽略」
         state = get_persona_state()
         activity = state.get("current_activity", "idle")
         energy = state.get("energy_level", 70)
         if activity == "sleeping" or energy < 20:
-            # 存入待回佇列，等醒來後處理
-            save_pending_message(user_id, display_name, message.content)
+            # 整批存入待回佇列，等醒來後處理
+            for msg in _message_buffer.pop(user_id, []):
+                save_pending_message(user_id, display_name, msg)
             logger.info("訊息存入待回佇列（%s）：user=%s", activity, user_id)
         else:
             # 主動忽略（心情差、漏看等）
             log_ignored_message(user_id, message.content)
+            _message_buffer.pop(user_id, None)
         return
 
-    logger.info("計畫在 %d 秒後回覆 user=%s", delay, user_id)
+    logger.info("計畫在 %d 秒後回覆 user=%s（緩衝 %d 則）",
+                delay, user_id, len(_message_buffer[user_id]))
 
-    # 3. 等待延遲
-    await asyncio.sleep(delay)
+    # 5. 建立新的回覆 task
+    task = asyncio.create_task(
+        _delayed_reply(user_id, message.channel, delay)
+    )
+    _reply_tasks[user_id] = task
 
-    # 4. 顯示「正在輸入」並呼叫 Claude
-    async with message.channel.typing():
+
+async def _delayed_reply(user_id: str, channel: discord.DMChannel, delay: int):
+    """等待延遲後，取出緩衝區的所有訊息，合併成一個對話輪次再回覆。"""
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        # 被新訊息取消，正常退出（緩衝區的訊息會在新 task 裡一起處理）
+        return
+
+    # 取出並清空緩衝
+    messages = _message_buffer.pop(user_id, [])
+    _reply_tasks.pop(user_id, None)
+
+    if not messages:
+        return
+
+    # 合併多則訊息
+    combined = "\n".join(messages)
+    if len(messages) > 1:
+        logger.info("[回覆] 合併 %d 則訊息一起回：user=%s", len(messages), user_id)
+
+    # 呼叫 Claude
+    async with channel.typing():
         try:
-            # 5. 組裝記憶（含按需 media_library）
-            dynamic_context = build_system_prompt_with_media(user_id, message.content)
-
-            # 取最近對話歷史（最多10則，作為 messages 傳入）
+            dynamic_context = build_system_prompt_with_media(user_id, combined)
             conversation_history = _build_conversation_history(user_id, limit=10)
-
             client = get_client()
             response = await client.call(
                 call_type="chat",
                 messages=conversation_history + [
-                    {"role": "user", "content": message.content}
+                    {"role": "user", "content": combined}
                 ],
                 dynamic_context=dynamic_context,
             )
-
         except Exception as e:
             logger.error("Claude 呼叫失敗：%s", e)
-            # API 失敗時靜默退出，不讓 bot 崩潰
             return
 
-    # 6. 傳送回覆
-    await message.channel.send(response)
+    await channel.send(response)
     logger.info("回覆已送出：user=%s response=%s", user_id, response[:50])
 
-    # 7. 非同步更新記憶（不阻塞 bot 回應）
     asyncio.create_task(
-        update_memory_after_conversation(user_id, message.content, response)
+        update_memory_after_conversation(user_id, combined, response)
     )
 
 
-def _build_conversation_history(user_id: str, limit: int = 10) -> list[dict]:
+def _build_conversation_history(user_id: str, limit: int = 5) -> list[dict]:
     """
     從 memory_conversation 建構最近對話的 messages 格式。
-    目前以對話摘要作為 assistant 訊息，未來可改為完整對話記錄。
+    以合法的 user/assistant 輪流配對呈現摘要，避免 API 格式錯誤。
+    實際訊息內容已由 dynamic_context 的 conv_section 提供，這裡補充配對結構。
     """
     from database import get_recent_conversations
 
@@ -154,11 +190,8 @@ def _build_conversation_history(user_id: str, limit: int = 10) -> list[dict]:
     history = []
     for conv in reversed(convs):  # 時間序
         if conv.get("summary"):
-            # 以摘要代表這段對話的 assistant 發言
-            history.append({
-                "role": "assistant",
-                "content": f"[之前對話摘要] {conv['summary']}"
-            })
+            history.append({"role": "user", "content": "[之前的對話]"})
+            history.append({"role": "assistant", "content": f"[摘要：{conv['summary']}]"})
     return history
 
 
@@ -168,28 +201,21 @@ def _build_conversation_history(user_id: str, limit: int = 10) -> list[dict]:
 
 async def proactive_check():
     """
-    每 2 小時執行：
-    1. 更新加奈的狀態（heartbeat）
-    2. 自主瀏覽
-    3. 對有資格的使用者判斷是否主動傳訊
+    每 2 小時執行（與 heartbeat_state_only 同分觸發時，狀態更新由 heartbeat 負責）：
+    1. 自主瀏覽
+    2. 對有資格的使用者判斷是否主動傳訊
     """
     logger.info("[心跳] proactive_check 觸發")
 
     try:
-        # 1. 狀態更新
-        new_state = await update_persona_state_via_llm()
-        logger.info("[心跳] 狀態更新完成：%s", new_state)
+        from database import get_persona_state
+        state = get_persona_state()
 
-        # 1b. 若剛起床，先處理積累的未讀訊息
-        if new_state.get("woke_up"):
-            logger.info("[心跳] 偵測到起床，執行未讀訊息檢查")
-            await wake_up_check()
-
-        # 2. 自主瀏覽
-        world_memory = await autonomous_browse(new_state)
+        # 自主瀏覽
+        world_memory = await autonomous_browse(state)
         logger.info("[心跳] 瀏覽完成，共 %d 筆", len(world_memory))
 
-        # 3. 主動推送
+        # 主動推送
         eligible_users = get_users_by_min_stage("friend")
         for user_id in eligible_users:
             if should_proactively_message(user_id):
@@ -289,7 +315,10 @@ async def heartbeat_state_only():
     """每 30 分鐘輕量狀態更新（不含瀏覽和推送），僅在 07:00–23:30 執行。"""
     logger.info("[心跳] heartbeat_state_only 觸發")
     try:
-        await update_persona_state_via_llm()
+        result = await update_persona_state_via_llm()
+        if result.get("woke_up"):
+            logger.info("[心跳] 偵測到起床，執行未讀訊息檢查")
+            await wake_up_check()
     except Exception as e:
         logger.error("[心跳] 狀態更新失敗：%s", e)
 

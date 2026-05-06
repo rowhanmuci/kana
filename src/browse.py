@@ -2,23 +2,17 @@
 browse.py — 自主瀏覽邏輯
 
 加奈的自主瀏覽行為：根據興趣和當前時間，抓取外部資訊並存入 memory_world。
-目前為 stub 實作，保留完整架構，fetch 函數可逐步補齊。
+- 09–11 點：暫停（tech_news stub）
+- 11–13 點：arXiv 多模態 AI 論文
+- 14–16 點：AniList 趨勢動漫
+- 19–21 點：AniList 更新中的動漫
 """
 
 import logging
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from typing import Optional
 
 logger = logging.getLogger(__name__)
-
-# ── 瀏覽觸發條件（依時間） ─────────────────────────────────────────────────────
-# schedule.md 定義：cron 0 9,11,14,16,19,21 * * *
-BROWSE_SCHEDULE = {
-    (9, 11):  "tech_news",
-    (11, 13): "arxiv",
-    (14, 16): "anime_community",
-    (19, 21): "anime_updates",
-}
 
 
 async def autonomous_browse(state: dict) -> list[dict]:
@@ -26,33 +20,26 @@ async def autonomous_browse(state: dict) -> list[dict]:
     根據加奈的興趣和當前時間，抓取外部資訊。
     最多處理 5 筆，讓 Claude 幫她「消化」成主觀反應，存入 memory_world。
 
-    Args:
-        state: 當前 persona_state dict
-
     Returns:
         原始資料列表（供 proactive pipeline 判斷觸發情境）
     """
     hour = datetime.now(timezone.utc).astimezone().hour
     results = []
 
-    if 9 <= hour < 11:
-        logger.info("[browse] 時段 09-11：抓取技術新聞")
-        results += await _fetch_tech_news()
-
     if 11 <= hour < 13:
         logger.info("[browse] 時段 11-13：抓取 arXiv 論文")
         results += await _fetch_arxiv()
 
-    if 14 <= hour < 16:
-        logger.info("[browse] 時段 14-16：抓取 AniList 動態")
-        results += await _fetch_anilist()
+    if 14 <= hour <= 16:
+        logger.info("[browse] 時段 14-16：抓取 AniList 趨勢動漫")
+        results += await _fetch_anilist_trending()
 
     if 19 <= hour < 21:
-        logger.info("[browse] 時段 19-21：抓取追蹤動漫更新")
-        results += await _fetch_anime_updates()
+        logger.info("[browse] 時段 19-21：抓取 AniList 更新中動漫")
+        results += await _fetch_anilist_airing()
 
     if not results:
-        logger.info("[browse] 本次無資料（fetch 函式尚為 stub 或本時段無排程）")
+        logger.info("[browse] 本次無資料（本時段無排程或 fetch 失敗）")
         return []
 
     # 每次最多消化 5 筆
@@ -71,66 +58,173 @@ async def autonomous_browse(state: dict) -> list[dict]:
     return to_process
 
 
-# ── Fetch 函數（stub，可逐步實作） ────────────────────────────────────────────
+# ── arXiv ────────────────────────────────────────────────────────────────────
 
-async def _fetch_tech_news() -> list[dict]:
-    """抓取技術新聞（RSS）。"""
-    logger.info("[browse] fetch_tech_news（stub）")
-    # TODO: 實作 RSS 抓取
-    # import feedparser
-    # feed = feedparser.parse("https://feeds.feedburner.com/TheHackersNews")
-    # return [{"source": "hackernews", "url": e.link, "title": e.title, "summary": e.summary[:200]}
-    #         for e in feed.entries[:3]]
-    return []
+ARXIV_QUERIES = [
+    "ti:multimodal+AND+ti:alignment",
+    "abs:cross-modal+language+model+alignment",
+    "ti:vision+language+model",
+]
 
 
 async def _fetch_arxiv() -> list[dict]:
-    """從 arXiv 抓取多模態 AI / 視覺語言模型相關論文。"""
-    logger.info("[browse] fetch_arxiv（stub）")
-    # TODO: 實作 arXiv API 查詢
-    # import aiohttp
-    # query = "multimodal+language+model+cross-modal+alignment"
-    # url = f"https://export.arxiv.org/api/query?search_query={query}&max_results=3"
-    # ...
-    return []
+    """從 arXiv 抓取多模態 AI / 跨模態對齊相關論文（最新 3 篇）。"""
+    import aiohttp
+
+    import random
+    query = random.choice(ARXIV_QUERIES)
+    url = "https://export.arxiv.org/api/query"
+    params = {
+        "search_query": query,
+        "max_results": 5,
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, params=params,
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                text = await resp.text()
+
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        root = ET.fromstring(text)
+        results = []
+        for entry in root.findall("atom:entry", ns)[:3]:
+            title_el = entry.find("atom:title", ns)
+            summary_el = entry.find("atom:summary", ns)
+            id_el = entry.find("atom:id", ns)
+            if title_el is None or id_el is None:
+                continue
+            title = title_el.text.strip().replace("\n", " ")
+            summary = (summary_el.text or "").strip()[:300]
+            link = id_el.text.strip()
+            results.append({
+                "source": "arxiv",
+                "url": link,
+                "title": title,
+                "summary": summary,
+                "tags": ["arxiv", "research", "multimodal"],
+            })
+
+        logger.info("[browse] arXiv 抓取成功：%d 篇", len(results))
+        return results
+
+    except Exception as e:
+        logger.warning("[browse] arXiv 抓取失敗：%s", e)
+        return []
 
 
-async def _fetch_anilist() -> list[dict]:
-    """抓取 AniList 近期動漫更新。"""
-    logger.info("[browse] fetch_anilist（stub）")
-    # TODO: 實作 AniList GraphQL API
-    # QUERY = '''{ Page(page:1, perPage:5) { media(type:ANIME, sort:TRENDING) {
-    #   title { romaji native } episodes meanScore siteUrl } } }'''
-    # ...
-    return []
+# ── AniList ──────────────────────────────────────────────────────────────────
+
+_ANILIST_URL = "https://graphql.anilist.co"
+
+_TRENDING_QUERY = """
+{
+  Page(page: 1, perPage: 5) {
+    media(type: ANIME, sort: TRENDING, isAdult: false) {
+      title { native romaji }
+      description(asHtml: false)
+      siteUrl
+      episodes
+      meanScore
+    }
+  }
+}
+"""
+
+_AIRING_QUERY = """
+{
+  Page(page: 1, perPage: 5) {
+    media(type: ANIME, status: RELEASING, sort: POPULARITY_DESC, isAdult: false) {
+      title { native romaji }
+      description(asHtml: false)
+      siteUrl
+      episodes
+      meanScore
+    }
+  }
+}
+"""
 
 
-async def _fetch_anime_updates() -> list[dict]:
-    """抓取追蹤中動漫的最新集數。"""
-    logger.info("[browse] fetch_anime_updates（stub）")
-    # TODO: 整合 AniList 或 MyAnimeList API
-    return []
+async def _query_anilist(gql: str) -> list[dict]:
+    """通用 AniList GraphQL 查詢，回傳 media 列表。"""
+    import aiohttp
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                _ANILIST_URL,
+                json={"query": gql},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                data = await resp.json()
+
+        media_list = (
+            data.get("data", {})
+                .get("Page", {})
+                .get("media", [])
+        )
+        results = []
+        for m in media_list[:3]:
+            title = m["title"]["native"] or m["title"]["romaji"] or "（未知）"
+            raw_desc = m.get("description") or ""
+            # 去掉 HTML 標籤
+            import re
+            desc = re.sub(r"<[^>]+>", "", raw_desc).strip()[:250]
+            url = m.get("siteUrl", "")
+            score = m.get("meanScore")
+            results.append({
+                "source": "anilist",
+                "url": url,
+                "title": title,
+                "summary": f"平均分：{score}/100\n{desc}" if score else desc,
+                "tags": ["anime", "anilist"],
+            })
+        return results
+
+    except Exception as e:
+        logger.warning("[browse] AniList 查詢失敗：%s", e)
+        return []
+
+
+async def _fetch_anilist_trending() -> list[dict]:
+    """抓取 AniList 趨勢動漫。"""
+    results = await _query_anilist(_TRENDING_QUERY)
+    logger.info("[browse] AniList 趨勢動漫：%d 筆", len(results))
+    return results
+
+
+async def _fetch_anilist_airing() -> list[dict]:
+    """抓取 AniList 目前播出中的動漫。"""
+    results = await _query_anilist(_AIRING_QUERY)
+    logger.info("[browse] AniList 播出中動漫：%d 筆", len(results))
+    return results
 
 
 # ── 反應生成 ──────────────────────────────────────────────────────────────────
 
-REACTION_SYSTEM = "你是加奈，用加奈的口吻寫出她看到這個資訊後的想法（繁體中文，30字以內）。只輸出想法本身，不加引號。"
+REACTION_SYSTEM = (
+    "你是加奈，用加奈的口吻寫出她看到這個資訊後的想法（繁體中文，30字以內）。"
+    "只輸出想法本身，不加引號、不加標籤。"
+)
 
 
 async def _generate_her_reaction(item: dict) -> str:
-    """
-    讓 Claude（Sonnet）幫加奈消化資訊，生成她的主觀反應。
-    失敗時回傳預設字串。
-    """
+    """讓 Claude 幫加奈消化資訊，生成她的主觀反應。"""
     from claude_client import get_client
 
-    client = get_client()
+    source_label = {"arxiv": "論文", "anilist": "動漫"}.get(item.get("source", ""), "資訊")
     prompt = (
-        f"標題：{item.get('title', '')}\n"
-        f"摘要：{item.get('summary', '')[:300]}\n\n"
+        f"【{source_label}】{item.get('title', '')}\n"
+        f"{item.get('summary', '')[:200]}\n\n"
         "加奈看到這個的想法（30字以內）："
     )
 
+    client = get_client()
     try:
         reaction = await client.call(
             call_type="browse",
@@ -139,7 +233,7 @@ async def _generate_her_reaction(item: dict) -> str:
         )
         return reaction.strip()
     except Exception as e:
-        logger.error("生成反應失敗：%s", e)
+        logger.error("[browse] 生成反應失敗：%s", e)
         return "（無反應）"
 
 
@@ -163,4 +257,4 @@ def _save_item_to_memory(item: dict, reaction: str) -> None:
         her_reaction=reaction,
         tags=tags,
     )
-    logger.info("瀏覽記憶已存：%s", item.get("title", ""))
+    logger.info("[browse] 已存：%s", item.get("title", ""))

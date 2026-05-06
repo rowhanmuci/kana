@@ -47,7 +47,6 @@ def init_db():
             id INTEGER PRIMARY KEY DEFAULT 1,
             current_activity TEXT DEFAULT 'idle',
             current_mood TEXT DEFAULT 'content',
-            thesis_progress INTEGER DEFAULT 0,
             energy_level INTEGER DEFAULT 70,
             last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -121,8 +120,8 @@ def init_db():
         # 初始化 persona_state（只有一筆）
         conn.execute("""
             INSERT OR IGNORE INTO persona_state (id, current_activity, current_mood,
-                thesis_progress, energy_level, last_updated)
-            VALUES (1, 'idle', 'content', 5, 70, CURRENT_TIMESTAMP)
+                energy_level, last_updated)
+            VALUES (1, 'idle', 'content', 70, CURRENT_TIMESTAMP)
         """)
 
     _seed_media_library()
@@ -458,9 +457,10 @@ def save_conversation_memory(user_id: str, data: dict) -> None:
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO memory_conversation
-                (user_id, summary, emotional_moment, familiarity_delta, affection_delta)
-            VALUES (?, ?, ?, ?, ?)
+                (created_at, user_id, summary, emotional_moment, familiarity_delta, affection_delta)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
+            now_taipei(),
             user_id,
             data.get("summary"),
             data.get("emotional_moment"),
@@ -486,9 +486,9 @@ def add_self_memory(type_: str, content: str,
                     mood_after: str = None, tags: list = None) -> None:
     with get_connection() as conn:
         conn.execute("""
-            INSERT INTO memory_self (type, content, mood_after, tags)
-            VALUES (?, ?, ?, ?)
-        """, (type_, content, mood_after, json.dumps(tags or [], ensure_ascii=False)))
+            INSERT INTO memory_self (created_at, type, content, mood_after, tags)
+            VALUES (?, ?, ?, ?, ?)
+        """, (now_taipei(), type_, content, mood_after, json.dumps(tags or [], ensure_ascii=False)))
 
 
 def get_recent_self_memories(limit: int = 7) -> list[dict]:
@@ -501,6 +501,7 @@ def get_recent_self_memories(limit: int = 7) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+
 # ─── memory_world ────────────────────────────────────────────────────────────
 
 def save_world_memory(source: str, url: str, title: str,
@@ -508,9 +509,9 @@ def save_world_memory(source: str, url: str, title: str,
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO memory_world
-                (source, url, title, summary, her_reaction, tags)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (source, url, title, summary, her_reaction,
+                (created_at, source, url, title, summary, her_reaction, tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (now_taipei(), source, url, title, summary, her_reaction,
               json.dumps(tags or [], ensure_ascii=False)))
 
 

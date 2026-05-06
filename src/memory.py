@@ -4,6 +4,7 @@ memory.py -- 記憶注入與更新邏輯
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 from database import (
@@ -17,7 +18,53 @@ from database import (
 )
 from claude_client import get_client
 
+_THESIS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "thesis.md"
+)
+
+THESIS_KEYWORDS = [
+    "論文", "進度", "指導教授", "研究方法", "實驗", "第幾章", "寫了多少",
+    "paper", "thesis", "baseline", "實驗設計", "跨模態", "對齊", "文獻",
+]
+
 logger = logging.getLogger(__name__)
+
+
+def _append_thesis_note(note: str, timestamp: str) -> None:
+    """將 writing_thesis 活動產生的筆記 append 到 thesis.md。"""
+    try:
+        try:
+            with open(_THESIS_PATH, "r", encoding="utf-8") as f:
+                content = f.read()
+        except FileNotFoundError:
+            content = ""
+
+        entry = f"- [{timestamp[:16]}] {note}\n"
+        if "近期工作記錄" not in content:
+            with open(_THESIS_PATH, "a", encoding="utf-8") as f:
+                f.write("\n\n---\n\n## 近期工作記錄\n\n" + entry)
+        else:
+            with open(_THESIS_PATH, "a", encoding="utf-8") as f:
+                f.write(entry)
+        logger.info("[論文] 工作記錄已寫入 thesis.md：%s", note)
+    except Exception as e:
+        logger.warning("[論文] 寫入 thesis.md 失敗：%s", e)
+
+
+def query_thesis_context(message: str) -> str:
+    """若訊息含論文相關關鍵字，讀取 thesis.md 回傳；否則回傳空字串。"""
+    if not any(k in message for k in THESIS_KEYWORDS):
+        return ""
+    try:
+        with open(_THESIS_PATH, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        return "[論文現況]\n" + content
+    except FileNotFoundError:
+        return ""
+    except Exception as e:
+        logger.warning("[thesis] 讀取 thesis.md 失敗：%s", e)
+        return ""
 
 
 def build_system_prompt(user_id: str) -> str:
@@ -35,8 +82,7 @@ def build_system_prompt(user_id: str) -> str:
         + "現在時間：" + now_str + "\n"
         + "你正在做的事：" + str(state.get("current_activity", "idle")) + "\n"
         + "你的心情：" + str(state.get("current_mood", "content")) + "\n"
-        + "體力：" + str(state.get("energy_level", 70)) + "/100\n"
-        + "論文進度：" + str(state.get("thesis_progress", 0)) + "/100"
+        + "體力：" + str(state.get("energy_level", 70)) + "/100"
     )
 
     if recent_self:
@@ -113,17 +159,24 @@ def build_system_prompt(user_id: str) -> str:
 
 def build_system_prompt_with_media(user_id: str, user_message: str) -> str:
     base = build_system_prompt(user_id)
+    parts = [base]
+
     media = query_relevant_media(user_message)
-    if not media:
-        return base
-    media_lines = "\n".join(
-        "- 《" + str(m["title"]) + "》（" + str(m.get("type", "")) + "）"
-        + (" 作者：" + str(m["author"]) if m.get("author") else "")
-        + (" 評分：" + str(m["score"]) + "/7" if m.get("score") else "")
-        + (" 你的感想：" + str(m["her_note"]) if m.get("her_note") else "")
-        for m in media
-    )
-    return base + "\n\n[你看過的相關作品（按需注入）]\n" + media_lines
+    if media:
+        media_lines = "\n".join(
+            "- 《" + str(m["title"]) + "》（" + str(m.get("type", "")) + "）"
+            + (" 作者：" + str(m["author"]) if m.get("author") else "")
+            + (" 評分：" + str(m["score"]) + "/7" if m.get("score") else "")
+            + (" 你的感想：" + str(m["her_note"]) if m.get("her_note") else "")
+            for m in media
+        )
+        parts.append("[你看過的相關作品（按需注入）]\n" + media_lines)
+
+    thesis = query_thesis_context(user_message)
+    if thesis:
+        parts.append(thesis)
+
+    return "\n\n".join(parts)
 
 
 def query_relevant_media(message: str) -> list:
@@ -198,23 +251,26 @@ def _make_heartbeat_prompt(state: dict) -> str:
         "現在時間：" + now + "（當地時間 " + str(hour) + " 點）\n"
         "加奈上一個狀態：活動=" + str(state.get("current_activity", "idle"))
         + "，心情=" + str(state.get("current_mood", "content"))
-        + "，體力=" + str(state.get("energy_level", 70))
-        + "，論文進度=" + str(state.get("thesis_progress", 0)) + "\n\n"
+        + "，體力=" + str(state.get("energy_level", 70)) + "\n\n"
         "根據時間推測加奈現在的狀態，輸出 JSON，所有欄位都必須填：\n"
         "- current_activity：sleeping|commuting|lab|reading|watching_anime|idle|writing_thesis 其中一個\n"
         "- current_mood：focused|lazy|anxious|content|irritated|distracted 其中一個\n"
-        "- energy_level：整數 0-100。每次 heartbeat 的變化規則：\n"
-        "    * idle / watching_anime / reading：-3 到 +5（放鬆，自然波動）\n"
-        "    * commuting：-5 到 -8（通勤消耗）\n"
-        "    * lab：-8 到 -12（實驗室高壓）\n"
-        "    * writing_thesis：-10 到 -15（論文最耗心力）\n"
+        "- energy_level：整數 0-100。每次 heartbeat 的變化規則（嚴格遵守，不可例外）：\n"
+        "    * idle / watching_anime / reading：-3 到 +5（放鬆狀態可小幅恢復）\n"
+        "    * commuting：只能減少，範圍 -5 到 -8\n"
+        "    * lab：只能減少，範圍 -8 到 -12（實驗室高壓，中途不會突然恢復）\n"
+        "    * writing_thesis：只能減少，範圍 -10 到 -15（論文最耗心力）\n"
         "    * 不可低於 5，不可高於 100\n"
-        "- thesis_progress：整數 0-100，代表論文完成百分比，只能增加或不變，每次最多 +2\n\n"
+        "    * 警告：lab / commuting / writing_thesis 狀態下體力只降不升，輸出比上一次高的數值是錯誤的\n"
+        "- thesis_note（可選）：只在 current_activity=writing_thesis 時填，"
+        "這次主要在做論文哪個部分（20字以內，例如「整理第三章，補充 baseline 說明」）；"
+        "其他活動時不要輸出這個欄位\n\n"
         "時段參考：7-8 點 idle（剛起床），8-9 點 commuting，10-18 點 lab 或 writing_thesis，"
         "19-23 點 watching_anime 或 reading 或 idle\n"
         "注意：0-7 點是強制睡眠期，heartbeat 不會在這段時間執行，不需要輸出 sleeping\n\n"
-        "輸出範例：{\"current_activity\": \"reading\", \"current_mood\": \"content\", "
-        "\"energy_level\": 65, \"thesis_progress\": 12}"
+        "輸出範例：{\"current_activity\": \"writing_thesis\", \"current_mood\": \"focused\", "
+        "\"energy_level\": 58, "
+        "\"thesis_note\": \"修改第二章文獻探討，補了兩篇 cross-modal 的 related work\"}"
     )
 
 
@@ -232,38 +288,55 @@ async def update_persona_state_via_llm() -> dict:
             system_override=HEARTBEAT_SYSTEM,
         )
 
-        # 過濾有效欄位，並強制 energy_level / thesis_progress 為整數
-        valid_keys = {"current_activity", "current_mood", "energy_level", "thesis_progress"}
+        # 過濾有效欄位，並強制 energy_level 為整數
+        valid_keys = {"current_activity", "current_mood", "energy_level"}
         filtered = {}
         for k, v in result.items():
             if k not in valid_keys:
                 continue
-            if k in ("energy_level", "thesis_progress"):
+            if k == "energy_level":
                 try:
                     filtered[k] = max(0, min(100, int(v)))
                 except (TypeError, ValueError):
-                    pass  # Claude 回傳非數字時跳過，保留舊值
+                    pass
             else:
                 filtered[k] = v
 
+        # 硬性保護：高消耗活動下體力不可上升
+        ENERGY_ONLY_DOWN = {"lab", "commuting", "writing_thesis"}
+        new_activity = filtered.get("current_activity", old_activity)
+        if new_activity in ENERGY_ONLY_DOWN and "energy_level" in filtered:
+            old_energy = state.get("energy_level", 100)
+            if filtered["energy_level"] > old_energy:
+                logger.warning(
+                    "[體力保護] %s 狀態下體力不應上升（%d → %d），強制修正",
+                    new_activity, old_energy, filtered["energy_level"]
+                )
+                # 給予最小消耗（-5），模擬「沒什麼在動」的低耗狀態
+                filtered["energy_level"] = max(5, old_energy - 5)
+
         update_persona_state(**filtered)
 
-        # 偵測 sleeping → 清醒的轉換
-        new_activity = filtered.get("current_activity", old_activity)
+        # 偵測 sleeping → 清醒的轉換（new_activity 已在上方體力保護區塊定義）
         woke_up = (old_activity == "sleeping" and new_activity != "sleeping")
 
         # 寫入 memory_self，讓 DB 留下心跳軌跡
         mood = filtered.get("current_mood", state.get("current_mood", ""))
         activity = new_activity
         energy = filtered.get("energy_level", state.get("energy_level", ""))
-        thesis = filtered.get("thesis_progress", state.get("thesis_progress", ""))
         tag = "wake_up" if woke_up else "heartbeat"
         content = (
-            f"起床了 → 活動={activity}，心情={mood}，體力={energy}，論文={thesis}%"
+            f"起床了 → 活動={activity}，心情={mood}，體力={energy}"
             if woke_up else
-            f"狀態更新 → 活動={activity}，心情={mood}，體力={energy}，論文={thesis}%"
+            f"狀態更新 → 活動={activity}，心情={mood}，體力={energy}"
         )
         add_self_memory(type_="heartbeat", content=content, mood_after=mood, tags=[tag])
+
+        # 論文工作記錄：若 Claude 回傳了 thesis_note，append 到 thesis.md
+        thesis_note = result.get("thesis_note")
+        if thesis_note and new_activity == "writing_thesis":
+            now_str = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+            _append_thesis_note(thesis_note, now_str)
 
         if woke_up:
             logger.info("偵測到起床：%s → %s", old_activity, new_activity)
@@ -297,7 +370,6 @@ async def write_daily_diary() -> None:
     ]
 
     # 收集今日的對話摘要
-    # 直接查 DB 取今天的對話
     from database import get_connection
     with get_connection() as conn:
         rows = conn.execute("""
@@ -311,7 +383,6 @@ async def write_daily_diary() -> None:
         logger.info("[日記] 今天沒有記錄，跳過")
         return
 
-    # 組裝給 Claude 的素材
     events_text = "\n".join(
         f"- {m['content']}" for m in today_events
     ) or "（無特別事件）"
@@ -323,7 +394,7 @@ async def write_daily_diary() -> None:
     state = get_persona_state()
     prompt = (
         f"今天是 {today}，加奈的狀態：心情={state.get('current_mood')}，"
-        f"體力={state.get('energy_level')}，論文進度={state.get('thesis_progress')}%\n\n"
+        f"體力={state.get('energy_level')}\n\n"
         f"今天發生的事：\n{events_text}\n\n"
         f"今天的對話：\n{convs_text}\n\n"
         "請用加奈的口吻寫今天的日記（繁體中文，200字以內，第一人稱，自然真實）："

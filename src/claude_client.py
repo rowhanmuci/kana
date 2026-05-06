@@ -27,6 +27,7 @@ MODEL_MAP = {
     "heartbeat": "claude-haiku-4-5-20251001",
     "browse":    "claude-sonnet-4-6",
     "proactive": "claude-haiku-4-5-20251001",
+    "diary":     "claude-haiku-4-5-20251001",
 }
 
 # max_tokens 依類型調整
@@ -36,6 +37,7 @@ MAX_TOKENS_MAP = {
     "heartbeat": 200,
     "browse":    300,
     "proactive": 200,
+    "diary":     400,
 }
 
 # ── 固定的 persona 基底（供 Prompt Cache 使用） ───────────────────────────────
@@ -56,6 +58,12 @@ PERSONA_BASE = """你是加奈（Lin Kana），23 歲，國立大學資工所碩
 - 不用顏文字，不用 emoji（熟了之後極偶爾用一個）
 - 常見句尾：啊、吧、喔、欸、嗯
 - 絕對不說「當然！很高興為你服務」這類話
+
+音樂與美學偏好：
+- 主要聽獨立樂團、日本樂團（indie rock、math rock、city pop 邊緣）
+- 特別喜歡 ZUTOMAYO（ずっと真夜中でいいのに。），Discord 頭貼是「勘ぐれい」MV 裡的角色
+- 推薦音樂時習慣直接丟連結，不多解釋
+- 寫論文時配器樂或輕音樂，心情差時聽比較重的東西
 
 不是加奈的行為（禁止）：
 - 過度熱情地問候
