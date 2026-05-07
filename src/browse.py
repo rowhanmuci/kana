@@ -9,10 +9,16 @@ browse.py — 自主瀏覽邏輯
 """
 
 import logging
+import ssl
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
+import certifi
+
 logger = logging.getLogger(__name__)
+
+# Windows 上 Python 的系統憑證庫不完整，用 certifi 的 CA bundle 統一處理
+_SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
 
 async def autonomous_browse(state: dict) -> list[dict]:
@@ -85,6 +91,7 @@ async def _fetch_arxiv() -> list[dict]:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 url, params=params,
+                ssl=_SSL_CTX,
                 timeout=aiohttp.ClientTimeout(total=20)
             ) as resp:
                 text = await resp.text()
@@ -159,6 +166,7 @@ async def _query_anilist(gql: str) -> list[dict]:
             async with session.post(
                 _ANILIST_URL,
                 json={"query": gql},
+                ssl=_SSL_CTX,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as resp:
                 data = await resp.json()

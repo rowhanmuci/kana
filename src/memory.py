@@ -296,7 +296,7 @@ async def update_persona_state_via_llm() -> dict:
                 continue
             if k == "energy_level":
                 try:
-                    filtered[k] = max(0, min(100, int(v)))
+                    filtered[k] = max(5, min(100, int(v)))
                 except (TypeError, ValueError):
                     pass
             else:
