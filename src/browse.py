@@ -68,8 +68,8 @@ async def autonomous_browse(state: dict) -> list[dict]:
 
 ARXIV_QUERIES = [
     "ti:multimodal AND ti:alignment",
-    "abs:cross-modal language model alignment",
-    "ti:vision language model",
+    "ti:cross-modal AND ti:alignment",
+    "ti:vision-language AND ti:model",
 ]
 
 
