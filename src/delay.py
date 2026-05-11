@@ -36,15 +36,6 @@ MOOD_SIGMA_BONUS: dict[str, float] = {
     "irritated":   0.25,
 }
 
-# ── 關係階段的「忘記回覆」機率 ────────────────────────────────────────────────
-FORGET_PROB: dict[str, float] = {
-    "stranger":     0.25,
-    "acquaintance": 0.15,
-    "friend":       0.08,
-    "close":        0.04,
-    "special":      0.02,
-}
-
 # ── 判斷「有趣話題」的關鍵字 ──────────────────────────────────────────────────
 INTERESTING_TOPIC_KEYWORDS = [
     # 學術相關
@@ -53,6 +44,8 @@ INTERESTING_TOPIC_KEYWORDS = [
     # 加奈喜歡的作品
     "村上春樹", "卡繆", "王家衛", "今敏", "藍色恐懼",
     "重慶森林", "少女終末旅行", "電腦線圈", "攻殼", "福音戰士",
+    # 音樂
+    "ZUTOMAYO", "ヨルシカ", "indie rock", "math rock", "city pop",
     # 觸動她的話題
     "孤獨", "記憶", "真實", "虛構", "意義",
 ]
@@ -132,17 +125,6 @@ def calculate_reply_delay(user_id: str, message: str) -> Optional[int]:
     # ── 從 log-normal 抽樣 ────────────────────────────────
     delay = float(np.random.lognormal(mean=mu, sigma=max(0.3, sigma)))
     delay = float(np.clip(delay, 8, 7200))
-
-    # ── 特殊事件：低機率的「完全忘記回」─────────────────
-    forget_prob = FORGET_PROB.get(stage, 0.15)
-
-    if random.random() < forget_prob:
-        if random.random() < 0.4:
-            logger.info("不回覆：漏看了（stage=%s, forget_prob=%.0f%%）", stage, forget_prob * 100)
-            return None
-        # 1–4 小時後才回
-        delay = random.uniform(3600, 14400)
-        logger.info("延遲回覆：暫時沒看到，%.0f 分鐘後才回", delay / 60)
 
     result = int(delay)
     logger.info(

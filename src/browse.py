@@ -9,6 +9,7 @@ browse.py — 自主瀏覽邏輯
 """
 
 import logging
+import random
 import ssl
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -48,8 +49,16 @@ async def autonomous_browse(state: dict) -> list[dict]:
         logger.info("[browse] 本次無資料（本時段無排程或 fetch 失敗）")
         return []
 
+    from database import world_memory_urls_existing
+    existing_urls = world_memory_urls_existing([r.get("url", "") for r in results])
+    new_results = [r for r in results if r.get("url", "") not in existing_urls]
+    if not new_results:
+        logger.info("[browse] 本次所有結果均已存過，跳過")
+        return []
+    logger.info("[browse] 過濾重複後剩 %d 筆（原 %d 筆）", len(new_results), len(results))
+
     # 每次最多消化 5 筆
-    to_process = results[:5]
+    to_process = new_results[:5]
     logger.info("[browse] 開始消化 %d 筆資料", len(to_process))
     saved = 0
     for item in to_process:
@@ -70,6 +79,18 @@ ARXIV_QUERIES = [
     "ti:multimodal AND ti:alignment",
     "ti:cross-modal AND ti:alignment",
     "ti:vision-language AND ti:model",
+    "ti:multimodal AND ti:generation",
+    "ti:video AND ti:language AND ti:model",
+    "ti:audio AND ti:visual AND ti:learning",
+    "ti:image AND ti:text AND ti:understanding",
+    "ti:embodied AND ti:multimodal",
+    "ti:contrastive AND ti:vision AND ti:language",
+    "ti:diffusion AND ti:multimodal",
+    "ti:multimodal AND ti:reasoning",
+    "ti:visual AND ti:question AND ti:answering",
+    "ti:speech AND ti:language AND ti:model",
+    "ti:large AND ti:multimodal AND ti:model",
+    "ti:visual AND ti:grounding AND ti:language",
 ]
 
 
@@ -128,33 +149,35 @@ async def _fetch_arxiv() -> list[dict]:
 
 _ANILIST_URL = "https://graphql.anilist.co"
 
-_TRENDING_QUERY = """
-{
-  Page(page: 1, perPage: 5) {
-    media(type: ANIME, sort: TRENDING, isAdult: false) {
-      title { native romaji }
+_TRENDING_QUERY_TPL = """
+{{
+  Page(page: {page}, perPage: 8) {{
+    media(type: ANIME, sort: TRENDING, isAdult: false) {{
+      title {{ native romaji }}
       description(asHtml: false)
       siteUrl
       episodes
       meanScore
-    }
-  }
-}
+    }}
+  }}
+}}
 """
 
-_AIRING_QUERY = """
-{
-  Page(page: 1, perPage: 5) {
-    media(type: ANIME, status: RELEASING, sort: POPULARITY_DESC, isAdult: false) {
-      title { native romaji }
+_AIRING_QUERY_TPL = """
+{{
+  Page(page: {page}, perPage: 8) {{
+    media(type: ANIME, status: RELEASING, sort: {sort}, isAdult: false) {{
+      title {{ native romaji }}
       description(asHtml: false)
       siteUrl
       episodes
       meanScore
-    }
-  }
-}
+    }}
+  }}
+}}
 """
+
+_AIRING_SORTS = ["POPULARITY_DESC", "SCORE_DESC", "TRENDING_DESC"]
 
 
 async def _query_anilist(gql: str) -> list[dict]:
@@ -200,16 +223,21 @@ async def _query_anilist(gql: str) -> list[dict]:
 
 
 async def _fetch_anilist_trending() -> list[dict]:
-    """抓取 AniList 趨勢動漫。"""
-    results = await _query_anilist(_TRENDING_QUERY)
-    logger.info("[browse] AniList 趨勢動漫：%d 筆", len(results))
+    """抓取 AniList 趨勢動漫（隨機頁碼）。"""
+    page = random.randint(1, 4)
+    gql = _TRENDING_QUERY_TPL.format(page=page)
+    results = await _query_anilist(gql)
+    logger.info("[browse] AniList 趨勢動漫 (page=%d)：%d 筆", page, len(results))
     return results
 
 
 async def _fetch_anilist_airing() -> list[dict]:
-    """抓取 AniList 目前播出中的動漫。"""
-    results = await _query_anilist(_AIRING_QUERY)
-    logger.info("[browse] AniList 播出中動漫：%d 筆", len(results))
+    """抓取 AniList 播出中動漫（隨機頁碼與排序）。"""
+    page = random.randint(1, 5)
+    sort = random.choice(_AIRING_SORTS)
+    gql = _AIRING_QUERY_TPL.format(page=page, sort=sort)
+    results = await _query_anilist(gql)
+    logger.info("[browse] AniList 播出中動漫 (page=%d, sort=%s)：%d 筆", page, sort, len(results))
     return results
 
 

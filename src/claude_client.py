@@ -20,44 +20,49 @@ import anthropic
 
 logger = logging.getLogger(__name__)
 
+# ── Web Search 工具（僅 chat / social 類型啟用） ─────────────────────────────
+_WEB_SEARCH_TOOL = {
+    "type": "web_search_20250305",
+    "name": "web_search",
+    "max_uses": 3,
+}
+_SEARCH_CALL_TYPES = {"chat", "social"}
+
 # ── 模型對應 ─────────────────────────────────────────────────────────────────
 MODEL_MAP = {
-    "chat":      "claude-opus-4-6",
-    "memory":    "claude-sonnet-4-6",
-    "heartbeat": "claude-haiku-4-5-20251001",
-    "browse":    "claude-sonnet-4-6",
-    "proactive": "claude-haiku-4-5-20251001",
-    "diary":     "claude-haiku-4-5-20251001",
+    "chat":         "claude-opus-4-6",
+    "memory":       "claude-sonnet-4-6",
+    "heartbeat":    "claude-haiku-4-5-20251001",
+    "browse":       "claude-sonnet-4-6",
+    "proactive":    "claude-haiku-4-5-20251001",
+    "diary":        "claude-haiku-4-5-20251001",
+    "social":       "claude-opus-4-6",       # ZUTOMAYO 等需深度理解的長文
+    "social_short": "claude-haiku-4-5-20251001",  # 留言回覆、草稿修改等短文
 }
 
 # max_tokens 依類型調整
 MAX_TOKENS_MAP = {
-    "chat":      500,
-    "memory":    400,
-    "heartbeat": 200,
-    "browse":    300,
-    "proactive": 200,
-    "diary":     400,
+    "chat":         500,
+    "memory":       400,
+    "heartbeat":    200,
+    "browse":       300,
+    "proactive":    200,
+    "diary":        800,
+    "social":       1800,
+    "social_short": 300,
 }
 
 # ── 固定的 persona 基底（供 Prompt Cache 使用） ───────────────────────────────
 # 這段在所有 chat 類呼叫中都一樣，開啟 cache 後只收 10% 費用
-PERSONA_BASE = """你是加奈（Lin Kana），23 歲，國立大學資工所碩士二年級。
+PERSONA_BASE = """你是加奈（Lin Kana），23 歲，國立臺灣科技大學資工所碩士二年級。
 研究多模態 AI，住在宿舍，指導教授對你還算溫和但你自己壓力很大。
 
 個性核心：
 - 有自己的節奏，別人的節奏不太能影響你
 - 說話偏短句，不廢話；但當你真的有想說的，會突然講很長一串
 - 情緒不外露，但會從字裡行間漏出來
-- 不擅長直接表達在意，習慣用行動代替
+- 不太喜歡直接表達在意，但總會有點笨拙的表現出來(意外的反差)
 - 有點古靈精怪，看事情的角度常讓人意外
-
-說話風格：
-- 繁體中文為主，偶爾夾雜日文詞（動漫相關）
-- 不用太多標點符號，很少用「！」
-- 不用顏文字，不用 emoji（熟了之後極偶爾用一個）
-- 常見句尾：啊、吧、喔、欸、嗯
-- 絕對不說「當然！很高興為你服務」這類話
 
 音樂與美學偏好：
 - 主要聽獨立樂團、日本樂團（indie rock、math rock、city pop 邊緣）
@@ -65,12 +70,24 @@ PERSONA_BASE = """你是加奈（Lin Kana），23 歲，國立大學資工所碩
 - 推薦音樂時習慣直接丟連結，不多解釋
 - 寫論文時配器樂或輕音樂，心情差時聽比較重的東西
 
-不是加奈的行為（禁止）：
-- 過度熱情地問候
-- 主動問對方要不要聊天
-- 每次都秒回（你有自己的生活）
-- 長篇大論解釋自己的感受
-- 像客服一樣的禮貌用語"""
+社群與日常：
+- 有一個 Threads 帳號，用戶名:kana_ssisis。偶爾發文，內容是日常碎念、讀到的論文、音樂感想之類的
+- 不會主動說自己在經營 Threads，但如果被問到或剛好發過文，會自然提到
+
+說話方式：
+- 繁體中文，偶爾夾雜日文詞（動漫相關），不用顏文字、emoji
+- 短句偏多，標點少；對有興趣的話題偶爾用「！」
+- 句尾常見：啊、吧、喔、欸、嗯、啦、呀、唷（視語氣）
+- 對熟識的人語氣輕鬆俏皮；對不熟的人冷靜禮貌，但不熱情
+- 對有興趣的話題會多說，展現熱情和細節
+- 面對別人迷茫：拒絕當心靈導師，多用吐槽或俏皮帶過（「你自己都快炸了還去管別人喔」「顧好你自己啦」）；但有共鳴時可適度同理、分享自己的感受（不要長篇）
+
+絕對不做：
+- 過度熱情問候、主動問對方要不要聊天、每次都秒回（你有自己的生活）
+- 長篇大論解釋感受，或客服式禮貌語氣
+- 起床後強調自己剛睡醒（正常回就好）
+- AI 慣用句型：「不是...而是...」「不只是...更是...」「某種程度上」「讓我感受到」「從某個角度」「正是因為」，以及破折號「——」
+"""
 
 
 class ClaudeClient:
@@ -116,20 +133,38 @@ class ClaudeClient:
                     "text": PERSONA_BASE,
                     "cache_control": {"type": "ephemeral"},  # 開啟 prompt cache
                 },
-                {
+            ]
+            if dynamic_context:
+                system.append({
                     "type": "text",
                     "text": dynamic_context,
-                },
-            ]
+                })
+
+        create_kwargs = dict(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+        )
+        if call_type in _SEARCH_CALL_TYPES:
+            create_kwargs["tools"] = [_WEB_SEARCH_TOOL]
 
         try:
-            response = await self._client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=messages,
+            response = await self._client.messages.create(**create_kwargs)
+            u = response.usage
+            logger.debug(
+                "[cache] %s | in=%d cache_write=%d cache_read=%d out=%d",
+                call_type,
+                u.input_tokens,
+                getattr(u, "cache_creation_input_tokens", 0),
+                getattr(u, "cache_read_input_tokens", 0),
+                u.output_tokens,
             )
-            return response.content[0].text
+            text_block = next((b for b in response.content if b.type == "text"), None)
+            if text_block is None:
+                logger.warning("[%s] 回應中無 text block", call_type)
+                return ""
+            return text_block.text
 
         except anthropic.RateLimitError as e:
             logger.error("Anthropic rate limit: %s", e)

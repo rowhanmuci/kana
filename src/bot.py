@@ -24,7 +24,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 from database import (
     init_db,
     ensure_user_exists,
-    log_ignored_message,
     log_proactive_message,
     decay_familiarity_all,
     get_users_by_min_stage,
@@ -32,7 +31,11 @@ from database import (
     get_pending_messages,
     get_pending_count,
     mark_pending_processed,
+    mark_single_pending_processed,
     get_persona_state,
+    save_message_log,
+    get_message_log,
+    get_all_pending_for_user,
 )
 from memory import (
     build_system_prompt_with_media,
@@ -45,7 +48,12 @@ from delay import (
     determine_trigger_context,
 )
 from browse import autonomous_browse
+from threads import autonomous_post, zutomayo_daily_post
 from claude_client import get_client
+from admin import (
+    ADMIN_CHANNEL_ID, OWNER_USER_ID,
+    send_draft_for_review, handle_raw_reaction, handle_admin_message,
+)
 
 # ── 日誌設定 ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -78,11 +86,16 @@ _reply_tasks:   dict[str, asyncio.Task] = {}  # user_id → 當前待執行的�
 
 @bot.event
 async def on_message(message: discord.Message):
-    # 忽略 bot 自己的訊息
     if message.author == bot.user:
         return
 
-    # 只處理 DM
+    # 管理員頻道：只接受 owner 的訊息，路由到 admin handler
+    if ADMIN_CHANNEL_ID and getattr(message.channel, "id", None) == ADMIN_CHANNEL_ID:
+        if message.author.id == OWNER_USER_ID:
+            await handle_admin_message(message, bot)
+        return
+
+    # 一般對話只處理 DM
     if not isinstance(message.channel, discord.DMChannel):
         return
 
@@ -94,12 +107,8 @@ async def on_message(message: discord.Message):
     # 1. 初始化新使用者
     ensure_user_exists(user_id, display_name)
 
-    # 2. 取消舊的待回覆 task（如果有的話），準備合併訊息
-    existing_task = _reply_tasks.get(user_id)
-    if existing_task and not existing_task.done():
-        existing_task.cancel()
-        logger.info("[訊息] 取消舊排程，合併訊息：user=%s（已累積 %d 則）",
-                    user_id, len(_message_buffer.get(user_id, [])))
+    # 2. 立刻寫入 DB，取得 id 供後續精確標記用
+    pending_id = save_pending_message(user_id, display_name, message.content)
 
     # 3. 累積訊息
     if user_id not in _message_buffer:
@@ -108,28 +117,36 @@ async def on_message(message: discord.Message):
 
     # 4. 判斷要不要回（以最新訊息為準）
     delay = calculate_reply_delay(user_id, message.content)
+
     if delay is None:
         state = get_persona_state()
         activity = state.get("current_activity", "idle")
         energy = state.get("energy_level", 70)
         if activity == "sleeping" or energy < 20:
-            # 整批存入待回佇列，等醒來後處理
-            for msg in _message_buffer.pop(user_id, []):
-                save_pending_message(user_id, display_name, msg)
+            # 睡著/低體力：清 buffer，取消舊 task，全部交給起床後的 pending 處理
+            _message_buffer.pop(user_id, None)
+            old_task = _reply_tasks.pop(user_id, None)
+            if old_task and not old_task.done():
+                old_task.cancel()
             logger.info("訊息存入待回佇列（%s）：user=%s", activity, user_id)
         else:
-            # 主動忽略（心情差、漏看等）
-            log_ignored_message(user_id, message.content)
-            _message_buffer.pop(user_id, None)
+            # 機率性忽略此則：只標記這一則為已處理，舊 task 繼續跑
+            mark_single_pending_processed(pending_id)
+            _message_buffer[user_id].pop()
+            if not _message_buffer[user_id]:
+                _message_buffer.pop(user_id, None)
         return
+
+    existing_task = _reply_tasks.get(user_id)
+    if existing_task and not existing_task.done():
+        existing_task.cancel()
+        logger.info("[訊息] 取消舊排程，合併訊息：user=%s（已累積 %d 則）",
+                    user_id, len(_message_buffer.get(user_id, [])))
 
     logger.info("計畫在 %d 秒後回覆 user=%s（緩衝 %d 則）",
                 delay, user_id, len(_message_buffer[user_id]))
 
-    # 5. 建立新的回覆 task
-    task = asyncio.create_task(
-        _delayed_reply(user_id, message.channel, delay)
-    )
+    task = asyncio.create_task(_delayed_reply(user_id, message.channel, delay))
     _reply_tasks[user_id] = task
 
 
@@ -148,51 +165,57 @@ async def _delayed_reply(user_id: str, channel: discord.DMChannel, delay: int):
     if not messages:
         return
 
+    # 再確認狀態：若延遲期間進入睡眠或體力耗盡，訊息已在 pending_messages，直接返回等起床處理
+    state = get_persona_state()
+    if state.get("current_activity") == "sleeping" or state.get("energy_level", 70) < 20:
+        logger.info("[回覆] 延遲期間加奈睡著，訊息保留於 pending_messages：user=%s", user_id)
+        return
+
     # 合併多則訊息
     combined = "\n".join(messages)
     if len(messages) > 1:
         logger.info("[回覆] 合併 %d 則訊息一起回：user=%s", len(messages), user_id)
 
     # 呼叫 Claude
-    async with channel.typing():
+    ctx = build_system_prompt_with_media(user_id, combined)
+    hist = _build_conversation_history(user_id, limit=10)
+
+    async def _call_claude() -> str | None:
         try:
-            dynamic_context = build_system_prompt_with_media(user_id, combined)
-            conversation_history = _build_conversation_history(user_id, limit=10)
-            client = get_client()
-            response = await client.call(
+            return await get_client().call(
                 call_type="chat",
-                messages=conversation_history + [
-                    {"role": "user", "content": combined}
-                ],
-                dynamic_context=dynamic_context,
+                messages=hist + [{"role": "user", "content": combined}],
+                dynamic_context=ctx,
             )
         except Exception as e:
             logger.error("Claude 呼叫失敗：%s", e)
-            return
+            return None
+
+    try:
+        async with channel.typing():
+            response = await _call_claude()
+    except discord.HTTPException:
+        logger.warning("[回覆] typing rate limit，跳過 typing 直接回覆")
+        response = await _call_claude()
+
+    if not response:
+        return
 
     await channel.send(response)
     logger.info("回覆已送出：user=%s response=%s", user_id, response[:50])
+    mark_pending_processed(user_id)
+    save_message_log(user_id, "user", combined)
+    save_message_log(user_id, "assistant", response)
 
     asyncio.create_task(
         update_memory_after_conversation(user_id, combined, response)
     )
 
 
-def _build_conversation_history(user_id: str, limit: int = 5) -> list[dict]:
-    """
-    從 memory_conversation 建構最近對話的 messages 格式。
-    以合法的 user/assistant 輪流配對呈現摘要，避免 API 格式錯誤。
-    實際訊息內容已由 dynamic_context 的 conv_section 提供，這裡補充配對結構。
-    """
-    from database import get_recent_conversations
-
-    convs = get_recent_conversations(user_id, limit=limit)
-    history = []
-    for conv in reversed(convs):  # 時間序
-        if conv.get("summary"):
-            history.append({"role": "user", "content": "[之前的對話]"})
-            history.append({"role": "assistant", "content": f"[摘要：{conv['summary']}]"})
-    return history
+def _build_conversation_history(user_id: str, limit: int = 20) -> list[dict]:
+    """從 message_log 取得最近的原始對話紀錄。"""
+    logs = get_message_log(user_id, limit=limit)
+    return [{"role": m["role"], "content": m["content"]} for m in logs]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -214,6 +237,12 @@ async def proactive_check():
         # 自主瀏覽
         world_memory = await autonomous_browse(state)
         logger.info("[心跳] 瀏覽完成，共 %d 筆", len(world_memory))
+
+        # Threads 自主發文草稿 → 送管理員審核
+        draft_text = await autonomous_post(world_memory, state)
+        if draft_text:
+            await send_draft_for_review(bot, draft_text, "threads_post")
+            logger.info("[心跳] Threads 草稿已送審")
 
         # 主動推送
         eligible_users = get_users_by_min_stage("friend")
@@ -264,48 +293,57 @@ async def wake_up_check():
 
     for item in pending:
         user_id = item["user_id"]
-        content = item["content"]
-        count = get_pending_count(user_id)  # 積了幾則
         received_at = item["received_at"]
 
-        logger.info("[起床] 處理 user=%s 的訊息（共 %d 則積累，最新：%s）",
-                    user_id, count, content[:30])
+        all_msgs = get_all_pending_for_user(user_id)
+        count = len(all_msgs)
 
-        # 用當前清醒狀態重新計算要不要回
-        delay = calculate_reply_delay(user_id, content)
-        mark_pending_processed(user_id)  # 不管回不回，先標為已處理
+        # 合併成一段文字，用最後一則判斷要不要回
+        last_content = all_msgs[-1]["content"]
+        if count == 1:
+            combined = last_content
+        else:
+            combined = "\n".join(
+                f"[{m['received_at']}] {m['content']}" for m in all_msgs
+            )
+
+        logger.info("[起床] 處理 user=%s 的訊息（共 %d 則積累）", user_id, count)
+
+        delay = calculate_reply_delay(user_id, last_content)
+        mark_pending_processed(user_id)
 
         if delay is None:
             logger.info("[起床] 決定不回覆 user=%s 的積累訊息", user_id)
-            log_ignored_message(user_id, content)
             continue
 
-        # 延遲較短（起床後通常比較快回）
         actual_delay = min(delay, 300)
         logger.info("[起床] 將在 %d 秒後回覆 user=%s", actual_delay, user_id)
         await asyncio.sleep(actual_delay)
 
         try:
             discord_user = await bot.fetch_user(int(user_id))
-            # 組裝 prompt，讓加奈知道這是睡前積累的訊息
-            context_note = (
-                f"[你剛起床，發現對方在 {received_at} 傳了訊息"
-                + (f"（加上之前還有 {count-1} 則沒看到的）" if count > 1 else "")
-                + "，請以加奈的方式自然地回應，可以提到剛睡醒這件事]"
-            )
-            dynamic_context = build_system_prompt_with_media(user_id, content)
+            if count == 1:
+                context_note = f"[對方在 {received_at} 傳了訊息，請以加奈的方式自然回應]"
+                user_turn = f"{context_note}\n\n使用者說：{combined}"
+            else:
+                context_note = f"[對方傳了 {count} 則訊息，按時間順序如下，請一併回應]"
+                user_turn = f"{context_note}\n\n{combined}"
+
+            dynamic_context = build_system_prompt_with_media(user_id, last_content)
             client = get_client()
             response = await client.call(
                 call_type="chat",
                 messages=_build_conversation_history(user_id) + [
-                    {"role": "user", "content": f"{context_note}\n\n使用者說：{content}"}
+                    {"role": "user", "content": user_turn}
                 ],
                 dynamic_context=dynamic_context,
             )
             await discord_user.send(response)
             logger.info("[起床] 已回覆 user=%s：%s", user_id, response[:50])
+            save_message_log(user_id, "user", combined)
+            save_message_log(user_id, "assistant", response)
             asyncio.create_task(
-                update_memory_after_conversation(user_id, content, response)
+                update_memory_after_conversation(user_id, combined, response)
             )
         except Exception as e:
             logger.error("[起床] 回覆失敗 user=%s：%s", user_id, e)
@@ -449,6 +487,7 @@ async def startup_reconcile():
             await wake_up_check()
         else:
             logger.info("[啟動] 狀態正常（offline=%.1fh），無需修正", hours_offline)
+            await wake_up_check()
 
 
 @bot.event
@@ -515,8 +554,37 @@ async def on_ready():
         id="daily_decay",
         timezone="Asia/Taipei",
     )
+    # 每日 20:00：ZUTOMAYO 演唱會倒數（生成草稿 → 送管理員審核）
+    async def _review_zutomayo():
+        result = await zutomayo_daily_post()
+        if result:
+            song, text = result
+            await send_draft_for_review(
+                bot, text, "threads_zutomayo",
+                context=f"倒數第{song['days_left']}天：{song['title']}",
+            )
+
+    scheduler.add_job(
+        _review_zutomayo,
+        "cron",
+        hour=20,
+        minute=0,
+        id="zutomayo_countdown",
+        timezone="Asia/Taipei",
+    )
     scheduler.start()
     logger.info("排程已啟動（台北時間）")
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.user_id == bot.user.id:
+        return
+    if not ADMIN_CHANNEL_ID or payload.channel_id != ADMIN_CHANNEL_ID:
+        return
+    if payload.user_id != OWNER_USER_ID:
+        return
+    await handle_raw_reaction(payload, bot)
 
 
 @bot.event

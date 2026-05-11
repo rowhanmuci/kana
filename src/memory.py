@@ -12,6 +12,8 @@ from database import (
     get_relationship,
     get_recent_conversations,
     get_recent_self_memories,
+    get_recent_self_memories_by_type,
+    get_recent_self_memories_excluding,
     get_recent_world_memories,
     save_conversation_memory,
     update_relationship,
@@ -70,7 +72,8 @@ def query_thesis_context(message: str) -> str:
 def build_system_prompt(user_id: str) -> str:
     state = get_persona_state()
     rel = get_relationship(user_id)
-    recent_self = get_recent_self_memories(limit=7)
+    recent_self = get_recent_self_memories_excluding(["heartbeat"], limit=7)
+    threads_posts = get_recent_self_memories_by_type(["threads_post", "threads_zutomayo"], limit=3)
     recent_world = get_recent_world_memories(limit=5)
     recent_convs = get_recent_conversations(user_id, limit=5)
 
@@ -150,11 +153,49 @@ def build_system_prompt(user_id: str) -> str:
         conv_lines = "（這是你們的第一次對話）"
     conv_section = "[最近的對話記錄（最近" + str(len(recent_convs)) + "筆摘要）]\n" + conv_lines
 
-    return "\n\n".join([
-        state_section, self_section, world_section,
-        rel_section, conv_section,
-        "根據以上狀態，用加奈的方式回應。",
-    ])
+    stage = rel.get("relationship_stage", "stranger") if rel else "stranger"
+    familiarity = rel.get("familiarity", 0) if rel else 0
+
+    if stage == "special":
+        tone_hint = (
+            "你們關係很特別，對方是你真的在乎的人。"
+            "說話可以很自然，不用過濾，偶爾可以展現你少見的軟的那面。"
+        )
+    elif stage == "close":
+        tone_hint = (
+            "你們很熟。語氣輕鬆，可以俏皮、吐槽、開對方玩笑，"
+            "說話不用克制，想說什麼就說。"
+        )
+    elif stage == "friend":
+        tone_hint = (
+            "你們已經是朋友了。語氣可以比平常放鬆，"
+            "對有趣的事多說幾句，偶爾俏皮一下也沒問題。"
+        )
+    elif stage == "acquaintance":
+        tone_hint = (
+            "你們不是完全陌生，有一點熟悉度。"
+            "可以稍微放鬆，對有興趣的話題自然地多回應一些。"
+        )
+    else:
+        tone_hint = (
+            "對方是不太熟的人，保持你平常的冷靜就好，"
+            "但如果對方說了什麼讓你有想法的，你還是可以有反應。"
+        )
+
+    if threads_posts:
+        threads_lines = "\n".join(
+            "- [" + str(m.get("created_at", ""))[:10] + "] " + str(m["content"])
+            for m in threads_posts
+        )
+        threads_section = "[Threads 近期發文]\n" + threads_lines
+    else:
+        threads_section = ""
+
+    sections = [state_section, self_section, world_section, rel_section, conv_section]
+    if threads_section:
+        sections.append(threads_section)
+    sections.append(f"根據以上狀態，用加奈的方式回應。{tone_hint}")
+    return "\n\n".join(sections)
 
 
 def build_system_prompt_with_media(user_id: str, user_message: str) -> str:
@@ -377,7 +418,7 @@ async def write_daily_diary() -> None:
             WHERE date(created_at) = ?
             ORDER BY created_at ASC
         """, (today,)).fetchall()
-    today_convs = [dict(r) for r in rows]
+        today_convs = [dict(r) for r in rows]
 
     if not today_events and not today_convs:
         logger.info("[日記] 今天沒有記錄，跳過")
