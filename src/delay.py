@@ -142,7 +142,9 @@ def hours_since_last_interaction(user_id: str) -> float:
     if not rel or not rel.get("last_interaction"):
         return float("inf")
 
-    last = datetime.fromisoformat(rel["last_interaction"])
+    last = rel["last_interaction"]
+    if not isinstance(last, datetime):
+        last = datetime.fromisoformat(str(last))
     if last.tzinfo is None:
         last = last.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)

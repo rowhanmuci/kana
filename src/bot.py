@@ -10,6 +10,7 @@ bot.py — 加奈 Discord Bot 主程式
 import asyncio
 import logging
 import os
+import re
 import sys
 
 from dotenv import load_dotenv
@@ -36,6 +37,9 @@ from database import (
     save_message_log,
     get_message_log,
     get_all_pending_for_user,
+    save_world_memory,
+    get_pending_commitments,
+    mark_commitment_done,
 )
 from memory import (
     build_system_prompt_with_media,
@@ -213,20 +217,139 @@ async def _delayed_reply(user_id: str, channel: discord.DMChannel, delay: int):
 
 
 def _build_conversation_history(user_id: str, limit: int = 20) -> list[dict]:
-    """從 message_log 取得最近的原始對話紀錄。"""
+    """從 message_log 取得最近的原始對話紀錄，確保 role 序列符合 Claude API 要求。"""
     logs = get_message_log(user_id, limit=limit)
-    return [{"role": m["role"], "content": m["content"]} for m in logs]
+    messages = []
+    for m in logs:
+        entry = {"role": m["role"], "content": f"[{m['created_at'][:16]}] {m['content']}"}
+        # 合併連續相同 role（主動推送後收到回覆前可能出現兩個 assistant）
+        if messages and messages[-1]["role"] == entry["role"]:
+            messages[-1]["content"] += "\n\n" + entry["content"]
+        else:
+            messages.append(entry)
+    # Claude API 要求第一則必須是 user
+    if messages and messages[0]["role"] == "assistant":
+        messages.insert(0, {"role": "user", "content": "（加奈主動開口）"})
+    return messages
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PROACTIVE PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _consume_commitment(c: dict) -> str:
+    """消化一筆承諾：依媒體類型選擇不同的取得方式，回傳加奈的第一人稱感想。"""
+    url = c.get("url", "") or ""
+    title = c.get("title", "") or ""
+    ctype = c.get("type", "other")
+    client = get_client()
+
+    # 1. YouTube 音樂：真實音訊分析
+    if ctype == "music" and url:
+        yt_match = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]{11})', url)
+        if yt_match:
+            from audio import analyze_youtube_audio
+            try:
+                audio_info = await analyze_youtube_audio(yt_match.group(1))
+            except Exception as e:
+                logger.warning("[承諾] audio 分析失敗 %s：%s", title, e)
+                audio_info = {}
+            if audio_info:
+                prompt = (
+                    f"你剛仔細聽完《{title}》的音訊資料：{audio_info}。"
+                    "用第一人稱寫一段對這首歌的感想（像記在腦子裡的印象，不是正式心得）。"
+                )
+                return await client.call(
+                    "commitment",
+                    [{"role": "user", "content": prompt}],
+                    system_override="你是加奈，用你平常的語氣。",
+                )
+
+    # 2. 純文字 URL：fetch_url 讀內容
+    if ctype == "url" and url:
+        from claude_client import _fetch_url_content
+        page_text = await _fetch_url_content(url)
+        prompt = (
+            f"你打開了「{title or url}」，內容是：{page_text[:1500]}。"
+            "用第一人稱寫 2–3 句感想。"
+        )
+        return await client.call(
+            "commitment",
+            [{"role": "user", "content": prompt}],
+            system_override="你是加奈，用你平常的語氣。",
+        )
+
+    # 3. 其他（anime/book/movie 或找不到 YouTube ID 的音樂）：web search
+    system = (
+        "你是加奈。你查了一下某個被推薦的東西，現在根據查到的資料寫 2–3 句印象。"
+        "注意：你沒有真的看/讀/聽，只是查了資料，措辭要誠實（「查了一下」「看評論說」），不能說「我看了」。"
+    )
+    query = f"{title} {url}".strip()
+    return await client.call(
+        "commitment",
+        [{"role": "user", "content": f"去查一下：{query}"}],
+        system_override=system,
+    )
+
+
+async def _push_commitment_reaction(user_id: str, c: dict, reaction: str):
+    """把承諾消化後的感想傳給當初推薦的 user。"""
+    title = c.get("title") or ""
+    ctype = c.get("type", "other")
+    action_verb = {"music": "聽了", "url": "看了"}.get(ctype, "查了一下")
+
+    prompt = (
+        f"你剛{action_verb}《{title}》，你的感想：{reaction}\n\n"
+        "說剛仔細聽完哪一首歌，把這個感想，以加奈的方式傳一則訊息給推薦這個給你的朋友，可以有主觀批判也可以有情緒反應，但要誠實表達你的感受。"
+        "（繁體中文，300字內，不要說「感想是」或用引號）。"
+    )
+    try:
+        dm_text = await get_client().call(
+            "commitment",
+            [{"role": "user", "content": prompt}],
+            system_override="你是加奈，用加奈平常的語氣傳訊息。",
+        )
+        discord_user = await bot.fetch_user(int(user_id))
+        await discord_user.send(dm_text)
+        save_message_log(user_id, "assistant", dm_text)
+        logger.info("[承諾] 感想已推送：user=%s title=%s", user_id, title)
+    except Exception as e:
+        logger.error("[承諾] 推送失敗 user=%s：%s", user_id, e)
+
+
+async def _process_pending_commitments():
+    """取出待辦承諾，依類型消化後存入 memory_world，並主動推感想給原始 user。"""
+    pending = get_pending_commitments(limit=3)
+    if not pending:
+        return
+    logger.info("[承諾] 開始處理 %d 筆待辦", len(pending))
+    for c in pending:
+        try:
+            reaction = await _consume_commitment(c)
+        except Exception as e:
+            logger.warning("[承諾] 消化失敗 %s：%s", c.get("title"), e)
+            reaction = ""
+        if reaction:
+            save_world_memory(
+                source="commitment",
+                url=c.get("url") or "",
+                title=c.get("title") or "",
+                summary=c.get("detail") or "",
+                her_reaction=reaction,
+            )
+            logger.info("[承諾] 消化完成：%s", c.get("title"))
+            user_id = c.get("user_id")
+            if user_id:
+                await _push_commitment_reaction(user_id, c, reaction)
+        mark_commitment_done(c["id"])
+
+
 async def proactive_check():
     """
     每 2 小時執行（與 heartbeat_state_only 同分觸發時，狀態更新由 heartbeat 負責）：
     1. 自主瀏覽
     2. 對有資格的使用者判斷是否主動傳訊
+    3. 消化待辦承諾
     """
     logger.info("[心跳] proactive_check 觸發")
 
@@ -249,6 +372,9 @@ async def proactive_check():
         for user_id in eligible_users:
             if should_proactively_message(user_id):
                 await _send_proactive_message(user_id, world_memory)
+
+        # 消化待辦承諾
+        await _process_pending_commitments()
 
     except Exception as e:
         logger.error("[心跳] proactive_check 失敗：%s", e)
@@ -273,6 +399,7 @@ async def _send_proactive_message(user_id: str, world_memory: list):
 
         discord_user = await bot.fetch_user(int(user_id))
         await discord_user.send(response)
+        save_message_log(user_id, "assistant", response)
         log_proactive_message(user_id, trigger_context, response)
         logger.info("[主動推送] 已傳送：user=%s", user_id)
 
@@ -396,14 +523,21 @@ async def night_sleep():
 
 
 async def daily_diary():
-    """每日 23:59 整理今天的日記。"""
-    from memory import write_daily_diary
+    """每日 23:59 整理今天的日記，接著執行 Reflect-Evolve 更新動態人格。"""
+    from memory import write_daily_diary, run_daily_reflect_evolve
     logger.info("[日記] 開始整理今日日記")
     try:
         await write_daily_diary()
         logger.info("[日記] 日記寫完了")
     except Exception as e:
         logger.error("[日記] 日記寫失敗：%s", e)
+
+    logger.info("[Reflect-Evolve] 開始")
+    try:
+        await run_daily_reflect_evolve()
+        logger.info("[Reflect-Evolve] 完成")
+    except Exception as e:
+        logger.error("[Reflect-Evolve] 失敗：%s", e)
 
 
 async def daily_decay():

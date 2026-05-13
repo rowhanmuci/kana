@@ -1,4 +1,4 @@
-﻿"""
+"""
 database.py — SQLite 操作封裝
 
 提供加奈專案所有資料表的 CRUD 操作。
@@ -136,6 +136,26 @@ def init_db():
             status TEXT DEFAULT 'pending',
             created_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS todo_commitments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            type TEXT,
+            title TEXT,
+            url TEXT,
+            detail TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', '+8 hours'))
+        );
+
+        CREATE TABLE IF NOT EXISTS dynamic_persona (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            updated_at TEXT,
+            current_obsessions TEXT DEFAULT '[]',
+            dynamic_interests TEXT DEFAULT '[]',
+            tone_tendencies TEXT DEFAULT '',
+            recent_sensitivities TEXT DEFAULT '[]'
+        );
         """)
 
         # 初始化 persona_state（只有一筆）
@@ -143,6 +163,12 @@ def init_db():
             INSERT OR IGNORE INTO persona_state (id, current_activity, current_mood,
                 energy_level, last_updated)
             VALUES (1, 'idle', 'content', 70, CURRENT_TIMESTAMP)
+        """)
+        # 初始化 dynamic_persona（只有一筆）
+        conn.execute("""
+            INSERT OR IGNORE INTO dynamic_persona
+                (id, updated_at, current_obsessions, dynamic_interests, tone_tendencies, recent_sensitivities)
+            VALUES (1, NULL, '[]', '[]', '', '[]')
         """)
 
 
@@ -551,9 +577,77 @@ def get_message_log(user_id: str, limit: int = 20) -> list[dict]:
     """取得最近 N 則原始訊息（時間正序），用於重建對話歷史。"""
     with get_connection() as conn:
         rows = conn.execute("""
-            SELECT role, content FROM message_log
+            SELECT role, content, created_at FROM message_log
             WHERE user_id = ?
             ORDER BY id DESC
             LIMIT ?
         """, (user_id, limit)).fetchall()
     return [dict(r) for r in reversed(rows)]
+
+
+# ─── todo_commitments（承諾任務佇列） ─────────────────────────────────────────
+
+def add_commitment(user_id: str, type_: str, title: str, url: str, detail: str) -> None:
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO todo_commitments (user_id, type, title, url, detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, type_, title, url, detail, now_taipei()))
+
+
+def get_pending_commitments(limit: int = 5) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT id, user_id, type, title, url, detail, created_at
+            FROM todo_commitments
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_commitment_done(commitment_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE todo_commitments SET status = 'done' WHERE id = ?",
+            (commitment_id,)
+        )
+
+
+# ─── dynamic_persona（GLA Evolve 狀態） ──────────────────────────────────────
+
+def get_dynamic_persona() -> dict:
+    """回傳 dynamic_persona，JSON 欄位已 parse 成 list。"""
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM dynamic_persona WHERE id = 1").fetchone()
+    if not row:
+        return {}
+    d = dict(row)
+    for field in ("current_obsessions", "dynamic_interests", "recent_sensitivities"):
+        try:
+            d[field] = json.loads(d.get(field) or "[]")
+        except Exception:
+            d[field] = []
+    return d
+
+
+def update_dynamic_persona(
+    obsessions: list, interests: list, tendencies: str, sensitivities: list
+) -> None:
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE dynamic_persona SET
+                updated_at = ?,
+                current_obsessions = ?,
+                dynamic_interests = ?,
+                tone_tendencies = ?,
+                recent_sensitivities = ?
+            WHERE id = 1
+        """, (
+            now_taipei(),
+            json.dumps(obsessions, ensure_ascii=False),
+            json.dumps(interests, ensure_ascii=False),
+            tendencies,
+            json.dumps(sensitivities, ensure_ascii=False),
+        ))

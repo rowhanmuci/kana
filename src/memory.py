@@ -5,17 +5,21 @@ memory.py -- 記憶注入與更新邏輯
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 from database import (
+    add_commitment,
+    add_self_memory,
+    get_dynamic_persona,
     get_persona_state,
     get_relationship,
     get_recent_conversations,
     get_recent_self_memories,
-    get_recent_self_memories_by_type,
     get_recent_self_memories_excluding,
     get_recent_world_memories,
     save_conversation_memory,
+    update_dynamic_persona,
     update_relationship,
 )
 from claude_client import get_client
@@ -73,12 +77,13 @@ def build_system_prompt(user_id: str) -> str:
     state = get_persona_state()
     rel = get_relationship(user_id)
     recent_self = get_recent_self_memories_excluding(["heartbeat"], limit=7)
-    threads_posts = get_recent_self_memories_by_type(["threads_post", "threads_zutomayo"], limit=3)
     recent_world = get_recent_world_memories(limit=5)
     recent_convs = get_recent_conversations(user_id, limit=5)
 
-    now = datetime.now(timezone.utc).astimezone()
-    now_str = now.strftime("%Y-%m-%d %H:%M")
+    from database import TAIPEI_TZ
+    now = datetime.now(TAIPEI_TZ)
+    _weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    now_str = now.strftime("%Y-%m-%d ") + _weekdays[now.weekday()] + now.strftime(" %H:%M")
 
     state_section = (
         "[當前狀態]\n"
@@ -117,7 +122,7 @@ def build_system_prompt(user_id: str) -> str:
                 first_met_date = None
         else:
             first_met_date = None
-
+                                                                                                                             
         if first_met_date:
             try:
                 days = (now.date() - first_met_date).days
@@ -182,19 +187,31 @@ def build_system_prompt(user_id: str) -> str:
             "但如果對方說了什麼讓你有想法的，你還是可以有反應。"
         )
 
-    if threads_posts:
-        threads_lines = "\n".join(
-            "- [" + str(m.get("created_at", ""))[:10] + "] " + str(m["content"])
-            for m in threads_posts
+    dp = get_dynamic_persona()
+    dp_section = ""
+    if dp and (dp.get("current_obsessions") or dp.get("dynamic_interests")):
+        obsessions = "、".join(dp.get("current_obsessions") or []) or "（無）"
+        interests_str = "、".join(dp.get("dynamic_interests") or []) or "（無）"
+        tendencies = dp.get("tone_tendencies") or "（無特別傾向）"
+        sensitivities = "、".join(dp.get("recent_sensitivities") or []) or "（無）"
+        dp_section = (
+            "[加奈近期的樣子（每日更新）]\n"
+            f"最近著迷的事：{obsessions}\n"
+            f"興趣方向：{interests_str}\n"
+            f"說話傾向：{tendencies}\n"
+            f"最近在意的事：{sensitivities}"
         )
-        threads_section = "[Threads 近期發文]\n" + threads_lines
-    else:
-        threads_section = ""
 
-    sections = [state_section, self_section, world_section, rel_section, conv_section]
-    if threads_section:
-        sections.append(threads_section)
-    sections.append(f"根據以上狀態，用加奈的方式回應。{tone_hint}")
+    sections = [state_section]
+    if dp_section:
+        sections.append(dp_section)
+    sections += [self_section, world_section, rel_section, conv_section]
+    sections.append(
+        f"根據以上狀態，用加奈的方式回應。{tone_hint}\n"
+        "對話歷史裡每則訊息的 [日期 時間] 是傳送時間，是給你參考用的元資料，"
+        "回覆中不要重複輸出這個格式。對方說「明天」「今天」「昨天」等相對時間時，"
+        "請對照該訊息的時間戳推算正確日期，不要假設和現在同一天。"
+    )
     return "\n\n".join(sections)
 
 
@@ -216,6 +233,9 @@ def build_system_prompt_with_media(user_id: str, user_message: str) -> str:
     thesis = query_thesis_context(user_message)
     if thesis:
         parts.append(thesis)
+
+    if re.search(r'https?://', user_message):
+        parts.append("[提醒] 訊息中有網址。請立刻用 fetch_url 工具打開讀取，不要說打不開或表示無法存取。")
 
     return "\n\n".join(parts)
 
@@ -254,7 +274,8 @@ def _make_eval_prompt(user_message: str, kana_response: str) -> str:
         '  "affection_delta": 0,\n'
         '  "new_known_facts": [],\n'
         '  "new_inside_jokes": [],\n'
-        '  "mood_toward_user": "neutral"\n'
+        '  "mood_toward_user": "neutral",\n'
+        '  "new_promises": []\n'
         "}"
     )
     return (
@@ -262,6 +283,9 @@ def _make_eval_prompt(user_message: str, kana_response: str) -> str:
         "mood_toward_user: neutral|warm|curious|flustered|annoyed|distant）：\n\n"
         "使用者說：" + user_message + "\n"
         "加奈回應：" + kana_response + "\n\n"
+        "new_promises：加奈在對話中說她之後會去看/聽/查的事情。"
+        '格式：[{"type": "music|anime|book|url|other", "title": "名稱", "url": "連結（沒有填空字串）", "detail": "她說了什麼"}]'
+        "。沒有承諾填 []。目標是捕捉已發生的承諾，不是要她承諾更多事。\n\n"
         + schema
     )
 
@@ -277,6 +301,20 @@ async def update_memory_after_conversation(user_id, user_message, kana_response)
         )
         update_relationship(user_id, result)
         save_conversation_memory(user_id, result)
+
+        for p in result.get("new_promises", []):
+            title = p.get("title", "")
+            if not title:
+                continue
+            add_commitment(
+                user_id=user_id,
+                type_=p.get("type", "other"),
+                title=title,
+                url=p.get("url", ""),
+                detail=p.get("detail", ""),
+            )
+            logger.info("[承諾] 寫入：%s (%s)", title, p.get("type", "other"))
+
         logger.info("記憶更新完成：user=%s summary=%s", user_id, result.get("summary", ""))
     except Exception as e:
         logger.error("記憶更新失敗：user=%s error=%s", user_id, e)
@@ -288,16 +326,30 @@ HEARTBEAT_SYSTEM = "你是一個角色狀態管理系統。只輸出 JSON，不�
 def _make_heartbeat_prompt(state: dict) -> str:
     now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %A")
     hour = datetime.now(timezone.utc).astimezone().hour
+
+    dp = get_dynamic_persona()
+    interests = dp.get("dynamic_interests", []) if dp else []
+    obsessions = dp.get("current_obsessions", []) if dp else []
+    interest_hint = ""
+    if interests or obsessions:
+        parts = []
+        if obsessions:
+            parts.append("最近在鑽：" + "、".join(obsessions))
+        if interests:
+            parts.append("興趣方向：" + "、".join(interests))
+        interest_hint = "加奈近期狀態（供 activity 選擇參考）：" + "；".join(parts) + "\n"
+
     return (
         "現在時間：" + now + "（當地時間 " + str(hour) + " 點）\n"
-        "加奈上一個狀態：活動=" + str(state.get("current_activity", "idle"))
+        + interest_hint
+        + "加奈上一個狀態：活動=" + str(state.get("current_activity", "idle"))
         + "，心情=" + str(state.get("current_mood", "content"))
         + "，體力=" + str(state.get("energy_level", 70)) + "\n\n"
         "根據時間推測加奈現在的狀態，輸出 JSON，所有欄位都必須填：\n"
-        "- current_activity：sleeping|commuting|lab|reading|watching_anime|idle|writing_thesis 其中一個\n"
+        "- current_activity：sleeping|commuting|lab|reading|watching_anime|idle|writing_thesis|listening_music 其中一個\n"
         "- current_mood：focused|lazy|anxious|content|irritated|distracted 其中一個\n"
         "- energy_level：整數 0-100。每次 heartbeat 的變化規則（嚴格遵守，不可例外）：\n"
-        "    * idle / watching_anime / reading：-3 到 +5（放鬆狀態可小幅恢復）\n"
+        "    * idle / watching_anime / reading / listening_music：-3 到 +5（放鬆狀態可小幅恢復）\n"
         "    * commuting：只能減少，範圍 -5 到 -8\n"
         "    * lab：只能減少，範圍 -8 到 -12（實驗室高壓，中途不會突然恢復）\n"
         "    * writing_thesis：只能減少，範圍 -10 到 -15（論文最耗心力）\n"
@@ -307,7 +359,7 @@ def _make_heartbeat_prompt(state: dict) -> str:
         "這次主要在做論文哪個部分（20字以內，例如「整理第三章，補充 baseline 說明」）；"
         "其他活動時不要輸出這個欄位\n\n"
         "時段參考：7-8 點 idle（剛起床），8-9 點 commuting，10-18 點 lab 或 writing_thesis，"
-        "19-23 點 watching_anime 或 reading 或 idle\n"
+        "19-23 點 watching_anime 或 reading 或 idle 或 listening_music\n"
         "注意：0-7 點是強制睡眠期，heartbeat 不會在這段時間執行，不需要輸出 sleeping\n\n"
         "輸出範例：{\"current_activity\": \"writing_thesis\", \"current_mood\": \"focused\", "
         "\"energy_level\": 58, "
@@ -402,12 +454,12 @@ async def write_daily_diary() -> None:
 
     today = date.today().isoformat()
 
-    # 收集今日的 memory_self（排除 heartbeat，留下有意義的事件）
+    # 收集今日的 memory_self（排除 heartbeat/daily_event，留下有意義的事件）
     all_self = get_recent_self_memories(limit=50)
     today_events = [
         m for m in all_self
         if str(m.get("created_at", ""))[:10] == today
-        and "heartbeat" not in json.loads(m.get("tags") or "[]")
+        and m.get("type") not in ("heartbeat", "daily_event")
     ]
 
     # 收集今日的對話摘要
@@ -457,3 +509,98 @@ async def write_daily_diary() -> None:
         logger.info("[日記] 今日日記寫完，%d 字", len(diary))
     except Exception as e:
         logger.error("[日記] 寫日記失敗：%s", e)
+
+
+# ── GLA Reflect-Evolve ────────────────────────────────────────────────────────
+
+REFLECT_SYSTEM = (
+    "你是加奈，用加奈的第一人稱語氣輸出。只輸出觀察內容，不要標題、日期或任何格式。"
+    "觀察要忠實反映你本來的品味與個性——若看到的東西和你原本不感興趣的領域有關（例如主流流行音樂），"
+    "不需要強迫自己說「有點感興趣」，可以說無感或忽略不提。"
+)
+EVOLVE_SYSTEM = "只輸出合法 JSON，不要其他說明。"
+
+
+async def run_daily_reflect_evolve() -> None:
+    """每日 Reflect → Evolve：把近期記憶壓縮成動態人格狀態。"""
+    client = get_client()
+
+    # ── Reflect：第一人稱自我觀察 ────────────────────────────────────────────
+    recent_self = get_recent_self_memories_excluding(["heartbeat", "daily_event"], limit=20)
+    recent_world = get_recent_world_memories(limit=10)
+
+    if not recent_self and not recent_world:
+        logger.info("[Reflect] 沒有記憶資料，跳過")
+        return
+
+    self_lines = "\n".join(
+        f"- [{str(m.get('created_at', ''))[:10]}] {m.get('type', '')}: {m['content']}"
+        for m in recent_self
+    ) or "（無）"
+
+    world_lines = "\n".join(
+        f"- {m['title']}（{m.get('source', '')}）：{m.get('her_reaction', '')}"
+        for m in recent_world
+    ) or "（無）"
+
+    reflect_prompt = (
+        "[加奈最近的記錄]\n\n"
+        f"【生活事件】\n{self_lines}\n\n"
+        f"【看到的東西】\n{world_lines}\n\n"
+        "請用加奈的第一人稱視角，寫出她對自己最近這段時間的內心觀察（繁體中文，150字以內）。"
+        "重點是她注意到自己最近有什麼傾向、在乎什麼、對什麼有感覺。"
+        "是內心獨白，不是日記，不需要日期。"
+    )
+
+    try:
+        reflection = await client.call(
+            call_type="memory",
+            messages=[{"role": "user", "content": reflect_prompt}],
+            system_override=REFLECT_SYSTEM,
+        )
+        reflection = reflection.strip()
+        add_self_memory(type_="reflection", content=reflection, tags=["reflection"])
+        logger.info("[Reflect] 完成，%d 字", len(reflection))
+    except Exception as e:
+        logger.error("[Reflect] 失敗：%s", e)
+        return
+
+    # ── Evolve：結構化人格更新 ───────────────────────────────────────────────
+    current_dp = get_dynamic_persona()
+    current_dp_json = json.dumps(
+        {k: v for k, v in current_dp.items() if k != "id" and k != "updated_at"},
+        ensure_ascii=False,
+    )
+
+    evolve_prompt = (
+        "根據加奈對自己的觀察，更新她的動態狀態。\n\n"
+        f"【她的觀察】\n{reflection}\n\n"
+        f"【上一次狀態（參考用）】\n{current_dp_json}\n\n"
+        "【判斷興趣是否納入的標準】\n"
+        "納入：她在觀察中表達了主動的感受、反覆琢磨、或因真實對話/體驗觸動的東西。\n"
+        "排除：她只是「看到了」某個資訊但沒有具體感受，或只是被動接收的瀏覽結果。\n"
+        "人格可以漂移，但漂移要由真實體驗驅動，不是由搜尋結果驅動。\n\n"
+        "輸出 JSON（只輸出 JSON，不要其他說明）：\n"
+        "{\n"
+        '  "current_obsessions": ["最近在鑽研或著迷的事，最多3項，具體"],\n'
+        '  "dynamic_interests": ["當前興趣方向，最多5項，須符合底色精神"],\n'
+        '  "tone_tendencies": "最近說話傾向，20字以內",\n'
+        '  "recent_sensitivities": ["最近比較在意或敏感的事，最多3項"]\n'
+        "}"
+    )
+
+    try:
+        result = await client.call_for_json(
+            call_type="memory",
+            messages=[{"role": "user", "content": evolve_prompt}],
+            system_override=EVOLVE_SYSTEM,
+        )
+        update_dynamic_persona(
+            obsessions=result.get("current_obsessions", []),
+            interests=result.get("dynamic_interests", []),
+            tendencies=result.get("tone_tendencies", ""),
+            sensitivities=result.get("recent_sensitivities", []),
+        )
+        logger.info("[Evolve] 完成：興趣=%s", result.get("dynamic_interests", []))
+    except Exception as e:
+        logger.error("[Evolve] 失敗：%s", e)

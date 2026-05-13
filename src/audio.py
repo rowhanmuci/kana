@@ -177,34 +177,51 @@ async def analyze_youtube_audio(video_id: str) -> dict:
                 other_22k  = _to22k(other_np)
                 vocals_22k = _to22k(vocals_np)
 
+                def _rms(arr):
+                    return float(librosa.feature.rms(y=arr).mean()) + 1e-9
+
+                mix_rms   = _rms(drums_22k + bass_22k + other_22k + vocals_22k)
+                drum_ratio  = _rms(drums_22k)  / mix_rms
+                bass_ratio  = _rms(bass_22k)   / mix_rms
+                other_ratio = _rms(other_22k)  / mix_rms
+
                 # ── 鼓組 ──────────────────────────────────────────────────
-                stft_d = np.abs(librosa.stft(drums_22k))
-                freqs = librosa.fft_frequencies(sr=22050)
-                kick_e  = float(stft_d[freqs < 150].mean())
-                hihat_e = float(stft_d[freqs > 5000].mean())
-                if kick_e > hihat_e * 1.5:
-                    drum_char = "低頻踢鼓厚實，節奏重量感強"
-                elif hihat_e > kick_e * 1.5:
-                    drum_char = "hi-hat 主導，節奏清脆密集"
+                if drum_ratio < 0.06:
+                    drum_char = None   # 能量過低，視為無鼓
                 else:
-                    drum_char = "踢鼓與 hi-hat 均衡分佈"
+                    stft_d = np.abs(librosa.stft(drums_22k))
+                    freqs = librosa.fft_frequencies(sr=22050)
+                    kick_e  = float(stft_d[freqs < 150].mean())
+                    hihat_e = float(stft_d[freqs > 5000].mean())
+                    if kick_e > hihat_e * 1.5:
+                        drum_char = "低頻踢鼓厚實，節奏重量感強"
+                    elif hihat_e > kick_e * 1.5:
+                        drum_char = "hi-hat 主導，節奏清脆密集"
+                    else:
+                        drum_char = "踢鼓與 hi-hat 均衡分佈"
 
                 # ── 貝斯 ──────────────────────────────────────────────────
-                bass_f0, _, _ = librosa.pyin(bass_22k, fmin=30, fmax=400, sr=22050)
-                valid_bass = bass_f0[~np.isnan(bass_f0)] if bass_f0 is not None else np.array([])
-                bass_root = librosa.hz_to_note(float(np.median(valid_bass))) if len(valid_bass) > 10 else None
-
-                # ── other（吉他/鋼琴/合成器）──────────────────────────────
-                centroid = float(librosa.feature.spectral_centroid(y=other_22k, sr=22050).mean())
-                chroma_std = float(librosa.feature.chroma_stft(y=other_22k, sr=22050).std())
-                if centroid > 3000:
-                    brightness = "高頻明亮（吉他/合成器清脆）"
-                elif centroid > 1500:
-                    brightness = "中頻飽滿（鋼琴/吉他層次豐富）"
+                if bass_ratio < 0.08:
+                    bass_root = None   # 能量過低，視為無貝斯
                 else:
-                    brightness = "低中頻厚重（氛圍感強）"
-                harmony = "和聲層次複雜" if chroma_std > 0.2 else "和聲線條精簡"
-                other_char = f"{brightness}，{harmony}"
+                    bass_f0, _, _ = librosa.pyin(bass_22k, fmin=30, fmax=400, sr=22050)
+                    valid_bass = bass_f0[~np.isnan(bass_f0)] if bass_f0 is not None else np.array([])
+                    bass_root = librosa.hz_to_note(float(np.median(valid_bass))) if len(valid_bass) > 10 else None
+
+                # ── other（伴奏音軌）──────────────────────────────────────
+                if other_ratio < 0.05:
+                    other_char = None
+                else:
+                    centroid = float(librosa.feature.spectral_centroid(y=other_22k, sr=22050).mean())
+                    chroma_std = float(librosa.feature.chroma_stft(y=other_22k, sr=22050).std())
+                    if centroid > 3000:
+                        brightness = "高頻輪廓清晰"
+                    elif centroid > 1500:
+                        brightness = "中頻層次豐富"
+                    else:
+                        brightness = "低中頻厚重，氛圍感強"
+                    harmony = "和聲層次複雜" if chroma_std > 0.2 else "和聲線條精簡"
+                    other_char = f"{brightness}，{harmony}"
 
                 # ── 人聲（獨立軌，比 HPSS 更準確）──────────────────────
                 f0v, _, _ = librosa.pyin(vocals_22k, fmin=150, fmax=900, sr=22050)

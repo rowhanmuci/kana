@@ -86,14 +86,36 @@ async def send_draft_for_review(
         return None
 
     label = _LABELS.get(type_, type_)
-    lines = [f"**[草稿 · {label}]**"]
+    header_lines = [f"**[草稿 · {label}]**"]
     if context:
         snippet = context[:120] + ("…" if len(context) > 120 else "")
-        lines.append(f"> {snippet}")
-    lines.append("")
-    lines.append(content)
+        header_lines.append(f"> {snippet}")
+    header_lines.append("")
+    header = "\n".join(header_lines)
 
-    msg = await channel.send("\n".join(lines))
+    # Discord 單則訊息上限 2000 字元，長草稿拆成多則，header 只貼第一則
+    _DISCORD_LIMIT = 1950
+    chunks: list[str] = []
+    remaining = content
+    while remaining:
+        if len(remaining) <= _DISCORD_LIMIT:
+            chunks.append(remaining)
+            break
+        cut = remaining.rfind("\n\n", 0, _DISCORD_LIMIT)
+        if cut == -1:
+            cut = remaining.rfind("\n", 0, _DISCORD_LIMIT)
+        if cut == -1:
+            cut = _DISCORD_LIMIT
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+
+    first_msg_content = header + chunks[0]
+    if len(first_msg_content) > 2000:
+        # header 太長壓縮一下（邊界情況）
+        first_msg_content = first_msg_content[:2000]
+    msg = await channel.send(first_msg_content)
+    for chunk in chunks[1:]:
+        await channel.send(chunk)
     await msg.add_reaction("✅")
     await msg.add_reaction("❌")
 
@@ -278,10 +300,13 @@ async def _handle_revision(draft: dict, feedback: str, bot) -> None:
 
     _append_style_note(feedback)
 
+    # 原稿超過 300 字用 social（Opus，1800 tokens），短文用 social_short（Haiku，300 tokens）
+    call_type = "social" if len(draft["content"]) > 300 else "social_short"
+
     client = get_client()
     try:
         revised = await client.call(
-            call_type="social_short",
+            call_type=call_type,
             messages=[{"role": "user", "content": prompt}],
             dynamic_context=_load_threads_style(),
         )
@@ -313,7 +338,7 @@ async def _handle_custom_instruction(instruction: str, bot) -> None:
     client = get_client()
     try:
         content = await client.call(
-            call_type="social_short",
+            call_type="social",
             messages=[{"role": "user", "content": prompt}],
             dynamic_context=_load_threads_style(),
         )

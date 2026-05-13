@@ -65,7 +65,7 @@ bash start.sh
 - 只回應 **DM**（私訊），公開伺服器頻道不處理
 - 訊息緩衝合併：延遲期間累積的訊息一起回
 - 根據當前狀態（活動、心情、體力）決定要不要回、多久回
-- 對話歷史：每次對話完整儲存至 `message_log`，作為下次對話 context
+- 對話歷史：每次對話完整儲存至 `message_log`（含時間戳），作為下次對話 context，讓加奈能正確推算對方說「明天」「今天」等相對時間
 - 對話後自動更新關係值、寫摘要、更新記憶
 
 ### 狀態機
@@ -80,9 +80,9 @@ bash start.sh
 | 04:00 | 熟悉度衰減 | 長時間未互動的使用者熟悉度自然下降 |
 | 07:00 | 起床 | 體力回滿 100，處理睡眠期間的未讀訊息 |
 | 07:30–23:30（每 30 分鐘） | 輕量心跳 | 更新活動、心情、體力 |
-| 09, 11, 14, 16, 19, 21 點 | 完整心跳 | 心跳 + 自主瀏覽 + Threads 草稿 + 主動推送 |
+| 09, 11, 14, 16, 19, 21 點 | 完整心跳 | 心跳 + 自主瀏覽 + Threads 草稿 + 主動推送 + 消化承諾 |
 | 20:00 | ZUTOMAYO 倒數 | 生成演唱會倒數貼文草稿，送管理員審核 |
-| 23:59 | 寫日記 | 整理今日事件，存入記憶 |
+| 23:59 | 日記 + Reflect-Evolve | 整理今日事件寫日記，接著執行 GLA Reflect-Evolve 更新動態人格 |
 
 #### 活動狀態（`current_activity`）
 
@@ -95,6 +95,7 @@ bash start.sh
 | `writing_thesis` | 在寫論文 |
 | `reading` | 在讀書 |
 | `watching_anime` | 在看動漫 |
+| `listening_music` | 在聽音樂（由 dynamic_interests 驅動，heartbeat 可選） |
 
 #### 心情狀態（`current_mood`）
 
@@ -110,6 +111,52 @@ bash start.sh
 - 其他 → 以 log-normal 分佈計算延遲秒數
 
 延遲受活動類型、心情（sigma 修正）、好感度（中位數最多縮短 55%）影響。
+
+---
+
+## GLA Reflect-Evolve 引擎
+
+加奈每天 23:59 在寫完日記後，執行一次 Perceive-Reflect-Evolve 循環，讓人格根據真實體驗緩慢演化。
+
+### 流程
+
+```
+當日 memory_self（非 heartbeat / daily_event）
++ memory_world 最近 10 筆
+        ↓
+    [Reflect] 第一人稱自我觀察（150 字，儲存為 type=reflection）
+        ↓
+    [Evolve] 結構化更新 dynamic_persona
+        ↓
+  下次對話注入 [加奈近期的樣子] section
+```
+
+### 演化原則
+
+興趣的漂移由**真實體驗**驅動（對話觸動、認真分析過的音樂、讀過的東西），被動接收的瀏覽結果不直接成為興趣。Reflect 階段對無感的資訊直接忽略，Evolve 階段只收錄有主動感受的內容。
+
+### `dynamic_persona` 欄位
+
+| 欄位 | 說明 | 上限 |
+|------|------|------|
+| `current_obsessions` | 最近著迷鑽研的事（具體） | 3 項 |
+| `dynamic_interests` | 當前興趣方向 | 5 項 |
+| `tone_tendencies` | 最近說話傾向（20 字） | — |
+| `recent_sensitivities` | 最近在意或敏感的事 | 3 項 |
+
+---
+
+## 承諾任務佇列（`todo_commitments`）
+
+對話中加奈說「之後會去聽/看/查」的東西，自動存入待辦佇列，完整心跳時消化：
+
+| 類型 | 消化方式 |
+|------|----------|
+| `music` + YouTube URL | `analyze_youtube_audio()` 真實音訊分析 |
+| `url` | fetch 頁面內容後生成感想 |
+| `anime` / `book` / 其他 | web search 查資料後生成感想（措辭誠實：「查了一下」） |
+
+消化完成後，加奈會主動傳訊息給當初提到這件事的 user，分享感想。傳出的訊息同步寫入 `message_log`，不造成對話斷層。
 
 ---
 
@@ -139,7 +186,7 @@ bash start.sh
 | 2. 音軌分離 | Demucs v4.0.1 htdemucs (GPU) | 鼓組特性、貝斯主根音、器樂層次、人聲音域與動態 |
 | 3. 語音轉錄 | Whisper large-v3 (GPU) | 歌詞時間結構輔助 |
 
-任何階段失敗都不影響其他階段，回傳已取得的部分結果。
+各音軌設有能量門檻（鼓 < 6%、貝斯 < 8%、器樂 < 5% mix 比例視為靜音），避免描述實際上不存在的樂器。任何階段失敗都不影響其他階段，回傳已取得的部分結果。
 
 ---
 
@@ -156,17 +203,21 @@ bash start.sh
 含「留言」等關鍵字 → 顯示貼文留言，點 ✉️ 讓加奈生成回覆草稿
 ```
 
+草稿修改依原稿長度自動選模型：原稿 > 300 字用 Opus（2500 tokens），短文用 Haiku（300 tokens）。長草稿自動拆成多則 Discord 訊息，完整內容存入 DB 不截斷。
+
 ---
 
 ## 自主瀏覽（`browse.py`）
 
-完整心跳時根據時段抓取外部資訊，過濾重複 URL 後存入 `memory_world`：
+完整心跳時根據 `dynamic_interests` 動態路由，過濾重複 URL 後存入 `memory_world`：
 
-| 時段 | 來源 | 說明 |
-|------|------|------|
-| 11–13 點 | arXiv | 多模態 AI 相關論文（隨機抽取多個 query） |
-| 14–16 點 | AniList | 趨勢動漫（隨機頁碼） |
-| 19–21 點 | AniList | 播出中動漫（隨機頁碼 + 排序） |
+| 條件 | 來源 |
+|------|------|
+| interests 含 AI / research / multimodal 等詞 | arXiv（多模態 AI 論文） |
+| interests 含 anime / manga / 動漫 等詞 | AniList（趨勢 / 播出中） |
+| 其他興趣 | Claude web_search（以英文 / 日文優先搜尋） |
+
+若 `dynamic_interests` 為空，回落原本時段排程（11–13 arXiv、14–16 AniList 趨勢、19–21 AniList 更新中）。
 
 ---
 
@@ -174,16 +225,18 @@ bash start.sh
 
 所有 LLM 呼叫透過 `claude_client.py` 統一管理：
 
-| 類型 | 模型 | 用途 |
-|------|------|------|
-| `chat` | claude-opus-4-6 | DM 對話回覆（含 web search） |
-| `social` | claude-opus-4-6 | Threads 長文生成（含 web search） |
-| `memory` | claude-sonnet-4-6 | 對話摘要、記憶更新 |
-| `browse` | claude-sonnet-4-6 | 瀏覽資訊消化 |
-| `heartbeat` | claude-haiku-4-5 | 狀態心跳更新 |
-| `proactive` | claude-haiku-4-5 | 主動推送訊息生成 |
-| `diary` | claude-haiku-4-5 | 日記與短文生成 |
-| `social_short` | claude-haiku-4-5 | 留言回覆、草稿小修 |
+| 類型 | 模型 | max_tokens | 用途 |
+|------|------|-----------|------|
+| `chat` | claude-opus-4-6 | 500 | DM 對話回覆（含 web search） |
+| `social` | claude-opus-4-6 | 2500 | Threads 長文生成（含 web search） |
+| `social_short` | claude-haiku-4-5 | 300 | 留言回覆、短草稿修改 |
+| `commitment` | claude-opus-4-6 | 400 | 承諾消化（音訊感想、閱讀感想） |
+| `memory` | claude-sonnet-4-6 | 400 | 對話摘要、記憶更新、Reflect-Evolve |
+| `browse` | claude-sonnet-4-6 | 300 | 瀏覽資訊消化 |
+| `interest_browse` | claude-sonnet-4-6 | 600 | 動態興趣 web search |
+| `heartbeat` | claude-haiku-4-5 | 200 | 狀態心跳更新 |
+| `proactive` | claude-haiku-4-5 | 200 | 主動推送訊息生成 |
+| `diary` | claude-haiku-4-5 | 800 | 日記生成 |
 
 PERSONA_BASE（角色設定）啟用 Prompt Cache，所有 chat 類呼叫共用同一份緩存。
 
@@ -202,6 +255,16 @@ PERSONA_BASE（角色設定）啟用 Prompt Cache，所有 chat 類呼叫共用�
 | current_mood | 目前心情 |
 | energy_level | 體力（0–100） |
 
+### `dynamic_persona`
+GLA Evolve 產生的動態人格狀態（只有一筆，id=1），每日 23:59 更新。
+
+| 欄位 | 說明 |
+|------|------|
+| current_obsessions | 最近著迷鑽研的事（JSON 陣列） |
+| dynamic_interests | 當前興趣方向（JSON 陣列），驅動自主瀏覽路由 |
+| tone_tendencies | 最近說話傾向（文字） |
+| recent_sensitivities | 最近在意的事（JSON 陣列） |
+
 ### `relationship`
 與每位使用者的關係紀錄。
 
@@ -219,7 +282,7 @@ PERSONA_BASE（角色設定）啟用 Prompt Cache，所有 chat 類呼叫共用�
 每次對話後的摘要與情感事件。
 
 ### `message_log`
-每次對話的原始訊息紀錄（role: user / assistant），作為對話歷史 context，取最近 20 則。
+每次對話的原始訊息紀錄（role: user / assistant），含傳送時間戳，作為對話歷史 context，取最近 20 則。主動推送訊息也寫入此表，避免對話斷層。
 
 ### `memory_self`
 加奈的自我記憶日誌。
@@ -228,12 +291,23 @@ PERSONA_BASE（角色設定）啟用 Prompt Cache，所有 chat 類呼叫共用�
 |------|------|
 | `heartbeat` | 每次狀態心跳的快照 |
 | `diary` | 每日日記（23:59） |
+| `reflection` | GLA Reflect 產生的第一人稱自我觀察（23:59，供 Evolve 消化） |
 | `daily_event` | 重要事件記錄 |
 | `threads_post` | Threads 自主發文記錄 |
 | `threads_zutomayo` | ZUTOMAYO 倒數文記錄 |
 
 ### `memory_world`
-自主瀏覽到的外部資訊（arXiv 論文、AniList 動漫）及加奈的第一人稱反應，依 URL 去重。
+自主瀏覽到的外部資訊（arXiv 論文、AniList 動漫、web search）及加奈的第一人稱反應，依 URL 去重。
+
+### `todo_commitments`
+加奈在對話中承諾「之後會去聽/看/查」的事項佇列。
+
+| 欄位 | 說明 |
+|------|------|
+| type | `music` / `anime` / `book` / `url` / `other` |
+| title | 作品或連結名稱 |
+| url | 若有連結 |
+| status | `pending` / `done` |
 
 ### `media_library`
 加奈的個人書單與影視清單（書、電影、動漫、漫畫、影集），供「你最近有在看什麼嗎？」類對話使用。
@@ -252,11 +326,11 @@ Threads 草稿審核佇列，記錄每份草稿的狀態（`pending` / `posted` 
 kana/
 ├── src/
 │   ├── bot.py           # Discord Bot 主程式、事件處理、排程
-│   ├── database.py      # SQLite CRUD（8 張資料表）
-│   ├── memory.py        # System prompt 組裝、對話記憶更新、日記
+│   ├── database.py      # SQLite CRUD（10 張資料表）
+│   ├── memory.py        # System prompt 組裝、對話記憶更新、日記、Reflect-Evolve
 │   ├── claude_client.py # Anthropic API 封裝（prompt cache、web search）
 │   ├── delay.py         # 回覆延遲計算、主動推送判斷
-│   ├── browse.py        # 自主瀏覽（arXiv、AniList）
+│   ├── browse.py        # 自主瀏覽（arXiv、AniList、動態興趣 web search）
 │   ├── threads.py       # Threads API、發文生成、ZUTOMAYO 倒數
 │   ├── audio.py         # YouTube 音訊分析（librosa / Demucs / Whisper）
 │   └── admin.py         # 管理員頻道草稿審核流程

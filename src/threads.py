@@ -66,12 +66,13 @@ ZUTOMAYO_COUNTDOWN = [
         "mv_id": "6OC92oxs4gA",
     },
     {
-        "title": "勘ぐれい",
-        "romaji": "Kangure i",
-        "context": "MV視覺風格印象深刻，加奈的 Discord 頭貼就是選自這支 MV。",
-        "lyrics_url": "https://www.uta-net.com/song/294388/",
-        "mv_id": "ugpywe34_30",
+        "title": "綺羅キラー(feat. Mori Calliope)",
+        "romaji": "Kira Killer",
+        "context": "與虛擬主播(Mori Calliope) 合作的歌曲，展現了獨特的流行電音風格與快嘴饒舌。",
+        "lyrics_url": "https://www.uta-net.com/song/329692/",
+        "mv_id": "e5LaKxJVeVI",
     },
+
     {
         "title": "秒針を噛む",
         "romaji": "Byoushin wo Kamu",
@@ -87,11 +88,11 @@ ZUTOMAYO_COUNTDOWN = [
         "mv_id": "IeyCdm9WwXM",
     },
     {
-        "title": "眩しいDNAだけ",
-        "romaji": "Mabushii DNA dake",
-        "context": "2019年第一張EP同期作品，是聽完會想馬上重聽的那種歌。",
-        "lyrics_url": "https://www.uta-net.com/song/268860/",
-        "mv_id": "VJy8qZ77bpE",
+        "title": "勘ぐれい",
+        "romaji": "Kangure i",
+        "context": "MV視覺風格印象深刻，加奈的 Discord 頭貼就是選自這支 MV。",
+        "lyrics_url": "https://www.uta-net.com/song/294388/",
+        "mv_id": "ugpywe34_30",
     },
 ]
 

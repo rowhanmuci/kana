@@ -22,28 +22,59 @@ logger = logging.getLogger(__name__)
 _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
 
+_AI_KEYWORDS = {"ai", "research", "multimodal", "diffusion", "language model",
+                "neural", "深度學習", "機器學習", "論文", "model", "alignment"}
+_ANIME_KEYWORDS = {"anime", "manga", "動漫", "漫畫", "番", "anilist"}
+
+
 async def autonomous_browse(state: dict) -> list[dict]:
     """
-    根據加奈的興趣和當前時間，抓取外部資訊。
+    根據加奈的動態興趣和當前時間，抓取外部資訊。
     最多處理 5 筆，讓 Claude 幫她「消化」成主觀反應，存入 memory_world。
 
     Returns:
         原始資料列表（供 proactive pipeline 判斷觸發情境）
     """
+    from database import get_dynamic_persona
+    import random as _random
+
     hour = datetime.now(timezone.utc).astimezone().hour
     results = []
 
+    dp = get_dynamic_persona()
+    interests = dp.get("dynamic_interests", []) if dp else []
+    interests_str = " ".join(interests).lower()
+
+    has_ai_interest = bool(interests) and any(k in interests_str for k in _AI_KEYWORDS)
+    has_anime_interest = bool(interests) and any(k in interests_str for k in _ANIME_KEYWORDS)
+    other_interests = [
+        i for i in interests
+        if not any(k in i.lower() for k in _AI_KEYWORDS)
+        and not any(k in i.lower() for k in _ANIME_KEYWORDS)
+    ]
+
+    # 標準時段抓取（有對應興趣時觸發；無任何興趣時回落原本排程）
     if 11 <= hour < 13:
-        logger.info("[browse] 時段 11-13：抓取 arXiv 論文")
-        results += await _fetch_arxiv()
+        if has_ai_interest or not interests:
+            logger.info("[browse] arXiv（AI興趣）")
+            results += await _fetch_arxiv()
 
     if 14 <= hour <= 16:
-        logger.info("[browse] 時段 14-16：抓取 AniList 趨勢動漫")
-        results += await _fetch_anilist_trending()
+        if has_anime_interest or not interests:
+            logger.info("[browse] AniList 趨勢（動漫興趣）")
+            results += await _fetch_anilist_trending()
 
     if 19 <= hour < 21:
-        logger.info("[browse] 時段 19-21：抓取 AniList 更新中動漫")
-        results += await _fetch_anilist_airing()
+        if has_anime_interest or not interests:
+            logger.info("[browse] AniList 更新中（動漫興趣）")
+            results += await _fetch_anilist_airing()
+
+    # 動態興趣 web search（每次最多選 2 個非標準興趣）
+    if other_interests:
+        chosen = _random.sample(other_interests, min(2, len(other_interests)))
+        for interest in chosen:
+            logger.info("[browse] web search 興趣：%s", interest)
+            results += await _fetch_by_interest_search(interest)
 
     if not results:
         logger.info("[browse] 本次無資料（本時段無排程或 fetch 失敗）")
@@ -239,6 +270,60 @@ async def _fetch_anilist_airing() -> list[dict]:
     results = await _query_anilist(gql)
     logger.info("[browse] AniList 播出中動漫 (page=%d, sort=%s)：%d 筆", page, sort, len(results))
     return results
+
+
+# ── 動態興趣 web search ───────────────────────────────────────────────────────
+
+async def _fetch_by_interest_search(interest: str) -> list[dict]:
+    """用 Claude web_search 找某個興趣的近期內容，回傳標準化 dict 列表。"""
+    import json as _json
+    from claude_client import get_client
+
+    prompt = (
+        f"Search for recent interesting content about 「{interest}」"
+        "（new releases, news, recommendations, etc.）.\n"
+        "Important: use the natural language of the topic — English for Western music/culture, "
+        "Japanese for J-music/anime, avoid Chinese-language sources unless the topic is inherently Chinese. "
+        "Find 2-3 items. Output JSON array only:\n"
+        '[{"title":"title","url":"url or empty string","summary":"50-char summary in Traditional Chinese"}]\n'
+        "Output the JSON array only, no other text."
+    )
+    system = (
+        "You are searching for content that matches Kana's taste: "
+        "indie rock, math rock, Japanese bands, multimodal AI, classic anime, literary fiction. "
+        "Prioritize English and Japanese sources over Chinese ones for music and anime topics. "
+        "Output only a valid JSON array, no other text."
+    )
+
+    try:
+        raw = await get_client().call(
+            call_type="interest_browse",
+            messages=[{"role": "user", "content": prompt}],
+            system_override=system,
+        )
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1]
+            raw = raw.rsplit("```", 1)[0]
+        items = _json.loads(raw)
+        if not isinstance(items, list):
+            return []
+        results = []
+        for item in items:
+            if not isinstance(item, dict) or not item.get("title"):
+                continue
+            results.append({
+                "source": "web",
+                "url": item.get("url", ""),
+                "title": item.get("title", ""),
+                "summary": item.get("summary", ""),
+                "tags": [interest, "web"],
+            })
+        logger.info("[browse] interest search (%s)：%d 筆", interest, len(results))
+        return results
+    except Exception as e:
+        logger.warning("[browse] interest search 失敗 (%s)：%s", interest, e)
+        return []
 
 
 # ── 反應生成 ──────────────────────────────────────────────────────────────────
